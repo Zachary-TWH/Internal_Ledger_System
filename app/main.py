@@ -9,10 +9,6 @@ from jose import JWTError, jwt
 from passlib.context import CryptContext
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from datetime import datetime, timedelta
-from slowapi import Limiter, _rate_limit_exceeded_handler
-from slowapi.util import get_remote_address
-from slowapi.errors import RateLimitExceeded
-from slowapi.middleware import SlowAPIMiddleware
 from .redis_client import redis_client
 import logging
 from contextlib import asynccontextmanager
@@ -35,10 +31,6 @@ app = FastAPI(lifespan=lifespan)
 Instrumentator().instrument(app).expose(app)
 
 
-limiter = Limiter(key_func=get_remote_address)
-app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
-app.add_middleware(SlowAPIMiddleware)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
@@ -136,8 +128,7 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
     return user
 
 @app.post("/register")
-@limiter.limit("5/minute")
-def register(request: Request, user: UserCreate, db: Session = Depends(get_db)):
+def register(user: UserCreate, db: Session = Depends(get_db)):
     # check if username already exists
     existing = db.query(models.User).filter_by(username=user.username).first()
     if existing:
@@ -153,8 +144,7 @@ def register(request: Request, user: UserCreate, db: Session = Depends(get_db)):
     return {"message": "User created successfully"}
 
 @app.post("/login")
-@limiter.limit("5/minute")
-def login(request: Request, form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
     user = db.query(models.User).filter_by(username=form_data.username).first()
     if not user or not verify_password(form_data.password, user.hashed_password):
         raise HTTPException(status_code=401, detail="Invalid credentials")
@@ -180,8 +170,7 @@ def login(request: Request, form_data: OAuth2PasswordRequestForm = Depends(), db
     }
 
 @app.post("/deposit")
-@limiter.limit("10/minute")
-async def deposit(request: Request,  req: DepositRequest, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+async def deposit( req: DepositRequest, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
     # idempotency check: has this exact request been processed before?
     existing = db.query(models.Transaction).filter_by(idempotency_key=req.idempotency_key).first()
     if existing:
@@ -226,8 +215,7 @@ async def deposit(request: Request,  req: DepositRequest, db: Session = Depends(
     return {"transaction_id": txn.id, "new_balance": account.balance}
 
 @app.post("/withdraw")
-@limiter.limit("10/minute")
-async def withdraw(request: Request, req: WithdrawalRequest, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+async def withdraw(req: WithdrawalRequest, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
     # req.idempotency_key = "wdr-001" (from JSON)
     # check if this exact request was already processed before
     existing = db.query(models.Transaction).filter_by(idempotency_key=req.idempotency_key).first()
@@ -281,9 +269,8 @@ async def withdraw(request: Request, req: WithdrawalRequest, db: Session = Depen
     db.refresh(account)
     return {"transaction_id": txn.id, "new_balance": account.balance}
 
-@app.post("/transfer")
-@limiter.limit("10/minute")         
-async def transfer(request: Request, req: TransferRequest, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+@app.post("/transfer")  
+async def transfer(req: TransferRequest, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
     # check if this exact transfer was already processed before
     existing = db.query(models.Transaction).filter_by(idempotency_key=req.idempotency_key).first()
     if existing:
@@ -373,8 +360,7 @@ async def transfer(request: Request, req: TransferRequest, db: Session = Depends
 
 # fetch account details, with caching
 @app.get("/accounts/{account_id}", response_model=AccountOut)
-@limiter.limit("5/minute")
-async def get_account(request: Request, account_id: int, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+async def get_account(account_id: int, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
     cache_key = f"account:{account_id}"
     cached = await redis_client.get(cache_key)
     if cached:
@@ -391,8 +377,7 @@ async def get_account(request: Request, account_id: int, db: Session = Depends(g
 
 # fetch all transactions for a given account, with pagination like statements
 @app.get("/accounts/{account_id}/transactions")
-@limiter.limit("5/minute")
-def get_transactions(request: Request, account_id: int, db: Session = Depends(get_db), page : int = 1, page_size: int = 20, current_user: models.User = Depends(get_current_user)):
+def get_transactions(account_id: int, db: Session = Depends(get_db), page : int = 1, page_size: int = 20, current_user: models.User = Depends(get_current_user)):
     # check account exists first
     account = db.query(models.Account).filter_by(id=account_id).first()
     if not account:
@@ -430,8 +415,7 @@ def get_transactions(request: Request, account_id: int, db: Session = Depends(ge
 
 # create a new account for the current user
 @app.post("/accounts", response_model=AccountOut)
-@limiter.limit("5/minute")
-def create_account(request: Request, account: AccountCreate, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+def create_account(account: AccountCreate, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
     new_account = models.Account(
         owner_name=account.owner_name,
         currency=account.currency,
@@ -445,8 +429,7 @@ def create_account(request: Request, account: AccountCreate, db: Session = Depen
 
 
 @app.post("/logout")
-@limiter.limit("10/minute")
-def logout(request: Request, req: RefreshTokenRequest, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+def logout(req: RefreshTokenRequest, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
     db_token = db.query(models.RefreshToken).filter_by(token=req.refresh_token, user_id=current_user.id).first()
     if not db_token:
         raise HTTPException(status_code=404, detail="Refresh token not found")
