@@ -1,7 +1,7 @@
 from fastapi import FastAPI, Depends, HTTPException
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, field_validator
-from .database import SessionLocal
+from .database import SessionLocal, engine, Base
 from . import models
 from decimal import Decimal
 from sqlalchemy import func
