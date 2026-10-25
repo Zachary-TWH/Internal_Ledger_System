@@ -1,26 +1,16 @@
-from fastapi import FastAPI, Depends, HTTPException, Request
+from fastapi import FastAPI, Depends, HTTPException
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, field_validator
 from .database import SessionLocal
 from . import models
 from decimal import Decimal
 from sqlalchemy import func
-from jose import JWTError, jwt
-from passlib.context import CryptContext
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from datetime import datetime, timedelta
 from .redis_client import redis_client
 import logging
 from contextlib import asynccontextmanager
 from prometheus_fastapi_instrumentator import Instrumentator
 
-SECRET_KEY = "your-secret-key-change-this-in-production"
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 30
-REFRESH_TOKEN_EXPIRE_DAYS = 7
 SUPPORTED_CURRENCIES = ["USD", "EUR", "GBP", "SGD", "JPY"]
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -61,10 +51,6 @@ class AccountOut(BaseModel):
     class Config:
         from_attributes = True  # lets Pydantic read SQLAlchemy objects directly
 
-class UserCreate(BaseModel):
-    username: str
-    password: str
-
 class DepositRequest(BaseModel):
     account_id: int
     amount: Decimal
@@ -104,73 +90,8 @@ class TransferRequest(BaseModel):
             raise ValueError("Amount must be greater than zero")
         return v
 
-def hash_password(password: str) -> str:
-    # converts "mysecret" → "$2b$12$randomhashstring..."
-    return pwd_context.hash(password[:72])
-
-def verify_password(plain_password: str, hashed_password: str) -> bool:
-    # checks if "mysecret" matches the stored hash — returns True or False
-    return pwd_context.verify(plain_password[:72], hashed_password)
-
-def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
-    # this runs on every protected endpoint — verifies the token
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        username = payload.get("sub")
-        if username is None:
-            raise HTTPException(status_code=401, detail="Invalid token")
-    except JWTError:
-        raise HTTPException(status_code=401, detail="Invalid token")
-
-    user = db.query(models.User).filter_by(username=username).first()
-    if user is None:
-        raise HTTPException(status_code=401, detail="User not found")
-    return user
-
-@app.post("/register")
-def register(user: UserCreate, db: Session = Depends(get_db)):
-    # check if username already exists
-    existing = db.query(models.User).filter_by(username=user.username).first()
-    if existing:
-        raise HTTPException(status_code=400, detail="Username already exists")
-
-    # hash the password before saving — never store plain text
-    new_user = models.User(
-        username=user.username,
-        hashed_password=hash_password(user.password)
-    )
-    db.add(new_user)
-    db.commit()
-    return {"message": "User created successfully"}
-
-@app.post("/login")
-def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
-    user = db.query(models.User).filter_by(username=form_data.username).first()
-    if not user or not verify_password(form_data.password, user.hashed_password):
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-
-    # create access token (short lived)
-    access_token = create_access_token(data={"sub": user.username})
-
-    # create refresh token (long lived, stored in DB)
-    refresh_token = create_refresh_token()
-    expires_at = datetime.utcnow() + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
-    db_refresh_token = models.RefreshToken(
-        token=refresh_token,
-        user_id=user.id,
-        expires_at=expires_at
-    )
-    db.add(db_refresh_token)
-    db.commit()
-
-    return {
-        "access_token": access_token,
-        "refresh_token": refresh_token,
-        "token_type": "bearer"
-    }
-
 @app.post("/deposit")
-async def deposit( req: DepositRequest, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+async def deposit(req: DepositRequest, db: Session = Depends(get_db)):
     # idempotency check: has this exact request been processed before?
     existing = db.query(models.Transaction).filter_by(idempotency_key=req.idempotency_key).first()
     if existing:
@@ -215,7 +136,7 @@ async def deposit( req: DepositRequest, db: Session = Depends(get_db), current_u
     return {"transaction_id": txn.id, "new_balance": account.balance}
 
 @app.post("/withdraw")
-async def withdraw(req: WithdrawalRequest, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+async def withdraw(req: WithdrawalRequest, db: Session = Depends(get_db)):
     # req.idempotency_key = "wdr-001" (from JSON)
     # check if this exact request was already processed before
     existing = db.query(models.Transaction).filter_by(idempotency_key=req.idempotency_key).first()
@@ -270,7 +191,7 @@ async def withdraw(req: WithdrawalRequest, db: Session = Depends(get_db), curren
     return {"transaction_id": txn.id, "new_balance": account.balance}
 
 @app.post("/transfer")  
-async def transfer(req: TransferRequest, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+async def transfer(req: TransferRequest, db: Session = Depends(get_db)):
     # check if this exact transfer was already processed before
     existing = db.query(models.Transaction).filter_by(idempotency_key=req.idempotency_key).first()
     if existing:
@@ -360,7 +281,7 @@ async def transfer(req: TransferRequest, db: Session = Depends(get_db), current_
 
 # fetch account details, with caching
 @app.get("/accounts/{account_id}", response_model=AccountOut)
-async def get_account(account_id: int, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+async def get_account(account_id: int, db: Session = Depends(get_db)):
     cache_key = f"account:{account_id}"
     cached = await redis_client.get(cache_key)
     if cached:
@@ -377,7 +298,7 @@ async def get_account(account_id: int, db: Session = Depends(get_db), current_us
 
 # fetch all transactions for a given account, with pagination like statements
 @app.get("/accounts/{account_id}/transactions")
-def get_transactions(account_id: int, db: Session = Depends(get_db), page : int = 1, page_size: int = 20, current_user: models.User = Depends(get_current_user)):
+def get_transactions(account_id: int, db: Session = Depends(get_db), page : int = 1, page_size: int = 20):
     # check account exists first
     account = db.query(models.Account).filter_by(id=account_id).first()
     if not account:
@@ -413,9 +334,9 @@ def get_transactions(account_id: int, db: Session = Depends(get_db), page : int 
 
 
 
-# create a new account for the current user
+# create a new account
 @app.post("/accounts", response_model=AccountOut)
-def create_account(account: AccountCreate, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+def create_account(account: AccountCreate, db: Session = Depends(get_db)):
     new_account = models.Account(
         owner_name=account.owner_name,
         currency=account.currency,
@@ -425,16 +346,3 @@ def create_account(account: AccountCreate, db: Session = Depends(get_db), curren
     db.commit()
     db.refresh(new_account)
     return new_account
-
-
-
-@app.post("/logout")
-def logout(req: RefreshTokenRequest, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
-    db_token = db.query(models.RefreshToken).filter_by(token=req.refresh_token, user_id=current_user.id).first()
-    if not db_token:
-        raise HTTPException(status_code=404, detail="Refresh token not found")
-
-    db_token.is_revoked = True
-    db.commit()
-    return {"message": "Logged out successfully"}
-
