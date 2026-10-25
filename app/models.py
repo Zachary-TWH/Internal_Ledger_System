@@ -1,5 +1,4 @@
 # defines the structure of the tables as Python classes and blueprints for SQLAlchemy to use when creating the tables in Postgres
-
 from sqlalchemy import Column, Integer, String, Numeric, ForeignKey, DateTime, Enum, Boolean
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
@@ -43,14 +42,6 @@ class LedgerEntry(Base):
 
     transaction = relationship("Transaction", back_populates="entries")
     account = relationship("Account")
-
-
-class User(Base):
-    __tablename__ = "users"
-
-    id = Column(Integer, primary_key=True, index=True)
-    username = Column(String, unique=True, nullable=False)
-    hashed_password = Column(String, nullable=False)
 
 
 class ExchangeRate(Base):
