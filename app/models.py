@@ -53,17 +53,6 @@ class User(Base):
     hashed_password = Column(String, nullable=False)
 
 
-class RefreshToken(Base):
-    __tablename__ = "refresh_tokens"
-
-    id = Column(Integer, primary_key=True, index=True)
-    token = Column(String, unique=True, nullable=False, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    expires_at = Column(DateTime, nullable=False)
-    is_revoked = Column(Boolean, default=False, nullable=False)
-
-    user = relationship("User")
-
 class ExchangeRate(Base):
     __tablename__ = "exchange_rates"
 

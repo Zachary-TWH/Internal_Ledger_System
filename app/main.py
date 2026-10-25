@@ -15,7 +15,6 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 from .redis_client import redis_client
 import logging
-import secrets
 from contextlib import asynccontextmanager
 from prometheus_fastapi_instrumentator import Instrumentator
 
@@ -46,8 +45,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-class RefreshTokenRequest(BaseModel):
-    refresh_token: str
 
 # This function gives each request its own database session, and closes it when done
 def get_db():
@@ -115,11 +112,6 @@ class TransferRequest(BaseModel):
             raise ValueError("Amount must be greater than zero")
         return v
 
-def create_refresh_token() -> str:
-    # generates a random 64-character string — not a JWT, just a random token
-    # stored in DB so it can be blacklisted
-    return secrets.token_hex(64)
-
 def hash_password(password: str) -> str:
     # converts "mysecret" → "$2b$12$randomhashstring..."
     return pwd_context.hash(password[:72])
@@ -127,13 +119,6 @@ def hash_password(password: str) -> str:
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     # checks if "mysecret" matches the stored hash — returns True or False
     return pwd_context.verify(plain_password[:72], hashed_password)
-
-def create_access_token(data: dict) -> str:
-    # data = {"sub": "alice"} — sub means "subject" (who this token is for)
-    to_encode = data.copy()
-    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    to_encode.update({"exp": expire})  # add expiry time to token
-    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
     # this runs on every protected endpoint — verifies the token
@@ -441,41 +426,7 @@ def get_transactions(request: Request, account_id: int, db: Session = Depends(ge
         "results": result
     }
 
-# integrity check endpoint: recompute the balance from ledger entries and compare to stored balance
-@app.get("/accounts/{account_id}/integrity")
-@limiter.limit("5/minute")
-def check_integrity(request: Request, account_id: int, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
-    # fetch the account
-    account = db.query(models.Account).filter_by(id=account_id).first()
-    if not account:
-        raise HTTPException(status_code=404, detail="Account not found")
 
-    # sum all CREDIT entries for this account
-    # func.sum() is SQLAlchemy's way of running SUM() in SQL
-    total_credits = db.query(func.sum(models.LedgerEntry.amount)).filter(
-        models.LedgerEntry.account_id == account_id,
-        models.LedgerEntry.entry_type == models.EntryType.CREDIT
-    ).scalar() or Decimal(0)  # scalar() returns a single value, not a list
-                               # "or Decimal(0)" handles case where no entries exist yet
-
-    # sum all DEBIT entries for this account
-    total_debits = db.query(func.sum(models.LedgerEntry.amount)).filter(
-        models.LedgerEntry.account_id == account_id,
-        models.LedgerEntry.entry_type == models.EntryType.DEBIT
-    ).scalar() or Decimal(0)
-
-    # recompute balance from ledger entries
-    computed_balance = total_credits - total_debits
-
-    # compare against stored balance
-    is_valid = computed_balance == account.balance
-
-    return {
-        "account_id": account_id,
-        "stored_balance": account.balance,
-        "computed_balance": computed_balance,
-        "is_valid": is_valid  # True = balances match, False = discrepancy detected
-    }
 
 # create a new account for the current user
 @app.post("/accounts", response_model=AccountOut)
@@ -491,20 +442,7 @@ def create_account(request: Request, account: AccountCreate, db: Session = Depen
     db.refresh(new_account)
     return new_account
 
-@app.post("/refresh")
-@limiter.limit("10/minute")
-def refresh(request: Request, req: RefreshTokenRequest, db: Session = Depends(get_db)):
-    db_token = db.query(models.RefreshToken).filter_by(token=req.refresh_token).first()
 
-    if not db_token:
-        raise HTTPException(status_code=401, detail="Invalid refresh token")
-    if db_token.is_revoked:
-        raise HTTPException(status_code=401, detail="Refresh token revoked")
-    if db_token.expires_at < datetime.utcnow():
-        raise HTTPException(status_code=401, detail="Refresh token expired")
-
-    new_access_token = create_access_token(data={"sub": db_token.user.username})
-    return {"access_token": new_access_token, "token_type": "bearer"}
 
 @app.post("/logout")
 @limiter.limit("10/minute")
@@ -517,15 +455,3 @@ def logout(request: Request, req: RefreshTokenRequest, db: Session = Depends(get
     db.commit()
     return {"message": "Logged out successfully"}
 
-@app.post("/dev-setup")
-def dev_setup(db: Session = Depends(get_db)):
-    # create EXTERNAL account
-    external = models.Account(owner_name="EXTERNAL", currency="USD", balance=0)
-    db.add(external)
-    # create Alice
-    alice = models.Account(owner_name="Alice", currency="USD", balance=0)
-    db.add(alice)
-    db.commit()
-    db.refresh(external)
-    db.refresh(alice)
-    return {"external_id": external.id, "alice_id": alice.id}
