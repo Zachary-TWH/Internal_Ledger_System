@@ -12,6 +12,7 @@ from sqlalchemy import (
     Integer,
     String,
     Numeric,
+    Boolean,
     ForeignKey,
     DateTime,
     Enum,
@@ -35,6 +36,8 @@ class Account(Base):
 
     `balance` is a stored balance that must be updated consistently with
     ledger postings. The ledger should provide the audit trail.
+    `is_system` marks internal accounts such as EXTERNAL, which users
+    cannot create through the API.
     """
 
     __tablename__ = "accounts"
@@ -47,7 +50,7 @@ class Account(Base):
         nullable=False,
         default=0,
     )
-
+    is_system = Column(Boolean, nullable=False, default=False)
 
 class Transaction(Base):
     """A business event grouping related ledger entries.

@@ -37,3 +37,5 @@ Design:
 
 
 ## Credentials: The database password in docker-compose.yml (default postgres, overridable via POSTGRES_PASSWORD) is a demo credential for local use only, so the project runs with no setup. A real deployment would inject secrets from a secrets manager and never commit them.
+
+## On container startup, entrypoint.sh runs create_tables.py, which creates the database tables and seeds an EXTERNAL account for each supported currency. The deposit and withdraw endpoints assume these accounts already exist and return a 500 if one is missing.

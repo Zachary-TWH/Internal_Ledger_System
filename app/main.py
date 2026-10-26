@@ -30,6 +30,7 @@ SUPPORTED_CURRENCIES = ["USD", "SGD"]
 
 app = FastAPI()
 
+Base.metadata.create_all(bind=engine)
 
 def get_db():
     """FastAPI dependency: give each request its own DB session, and always close it."""
@@ -144,15 +145,15 @@ async def deposit(req: DepositRequest, db: Session = Depends(get_db)):
     if existing:
         raise HTTPException(status_code=409, detail="Duplicate request")
 
-    # find the EXTERNAL account dynamically instead of hardcoding its id
-    external = db.query(models.Account).filter_by(owner_name="EXTERNAL", currency=req.currency).first()
-    if not external:
-        raise HTTPException(status_code=500, detail="EXTERNAL account not configured")
-
     # with_for_update() locks the row so no other transaction can modify it until we commit or rollback
     account = db.query(models.Account).filter_by(id=req.account_id).with_for_update().first()
     if not account:
         raise HTTPException(status_code=404, detail="Account not found")
+
+    # find the EXTERNAL account dynamically instead of hardcoding its id
+    external = db.query(models.Account).filter_by(owner_name="EXTERNAL", currency=account.currency).first()
+    if not external:
+        raise HTTPException(status_code=500, detail="EXTERNAL account not configured")
 
     # create the transaction record
     txn = models.Transaction(idempotency_key=req.idempotency_key, description="Deposit")
@@ -202,16 +203,16 @@ async def withdraw(req: WithdrawalRequest, db: Session = Depends(get_db)):
     existing = db.query(models.Transaction).filter_by(idempotency_key=req.idempotency_key).first()
     if existing:
         raise HTTPException(status_code=409, detail="Duplicate request")
-
-    # find the EXTERNAL account dynamically instead of hardcoding its id
-    external = db.query(models.Account).filter_by(owner_name="EXTERNAL", currency=req.currency).first()
-    if not external:
-        raise HTTPException(status_code=500, detail="EXTERNAL account not configured")
-
+     
     # with_for_update() locks the row so no other transaction can modify it until we commit or rollback
     account = db.query(models.Account).filter_by(id=req.account_id).with_for_update().first()
     if not account:
         raise HTTPException(status_code=404, detail="Account not found")
+   
+    # find the EXTERNAL account dynamically instead of hardcoding its id
+    external = db.query(models.Account).filter_by(owner_name="EXTERNAL", currency=account.currency).first()
+    if not external:
+        raise HTTPException(status_code=500, detail="EXTERNAL account not configured")
 
     # does the account have enough money? (e.g. balance 100 >= amount 40)
     if account.balance < req.amount:
@@ -280,6 +281,7 @@ async def transfer(req: TransferRequest, db: Session = Depends(get_db)):
     lock_first_id = min(req.from_account_id, req.to_account_id)
     lock_second_id = max(req.from_account_id, req.to_account_id)
 
+    # load both accounts with row locks (SELECT ... FOR UPDATE)
     first = db.query(models.Account).filter_by(id=lock_first_id).with_for_update().first()
     second = db.query(models.Account).filter_by(id=lock_second_id).with_for_update().first()
 
