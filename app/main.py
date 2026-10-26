@@ -24,6 +24,9 @@ from .database import SessionLocal, engine, Base
 from . import models
 from decimal import Decimal
 from sqlalchemy import func
+from typing import Optional
+from decimal import Decimal
+
 
 
 SUPPORTED_CURRENCIES = ["USD", "SGD"]

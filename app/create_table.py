@@ -26,5 +26,6 @@ def main():
         db.close()
     print("Tables and system accounts ready.")
 
+# Run this script to create the database tables and the EXTERNAL system accounts.
 if __name__ == "__main__":
     main()

@@ -1,4 +1,3 @@
-
 """SQLAlchemy models for the financial ledger and FX rate storage.
 
 These models define the database schema. They do not implement transaction
