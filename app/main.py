@@ -22,8 +22,9 @@ from sqlalchemy.orm import Session
 from pydantic import BaseModel, field_validator
 from .database import SessionLocal, engine, Base
 from . import models
-from decimal import Decimal
-from sqlalchemy import func
+from decimal import Decimal, ROUND_HALF_UP
+from datetime import datetime
+from sqlalchemy import func, case, and_
 from typing import Optional
 from decimal import Decimal
 
@@ -413,4 +414,179 @@ def get_transactions(account_id: int, db: Session = Depends(get_db), page: int =
         "page": page,
         "page_size": page_size,
         "results": result
+    }
+
+
+# ---------------------------------------------------------------------------
+# Month-end reconciliation
+# ---------------------------------------------------------------------------
+
+CENT = Decimal("0.01")
+
+
+def _money(value) -> Decimal:
+    """Round a database sum to 2 decimal places (the scale every amount is stored at)."""
+    return Decimal(value or 0).quantize(CENT, rounding=ROUND_HALF_UP)
+
+
+@app.get("/reconciliation/month-end")
+def month_end_reconciliation(month: str, only_discrepancies: bool = False, db: Session = Depends(get_db)):
+    """Reconcile every account against the ledger for one month. Read-only: never edits balances.
+
+    Query params:
+      month               "YYYY-MM", e.g. "2026-10"
+      only_discrepancies  if true, `accounts` lists only the accounts that do not reconcile
+
+    Two checks are run:
+      1. Account check. Ledger balance = credits - debits over ALL ledger entries. It must equal
+         the account's stored balance. Each account also gets opening_balance (ledger balance
+         before the month), the month's credits and debits, and closing_balance (ledger balance at
+         the end of the month), so the month's activity can be tied out to a bank-statement view.
+         Accounts with is_system=True (EXTERNAL) are listed with their ledger balance but are not
+         compared, because deposits and withdrawals never update the EXTERNAL stored balance.
+      2. Transaction check, for transactions created in the month. Each must have exactly one
+         DEBIT and one CREDIT entry. Same-currency transactions need debit == credit. Cross-currency
+         ones need credit == debit * exchange_rate_used (rounded to 2 dp, 0.01 tolerance).
+
+    Amounts are returned as strings with 2 decimal places so no float rounding can hide a difference.
+    Returns 200 even when discrepancies exist; check the "status" field.
+    Errors: 400 month is not in YYYY-MM format
+    """
+    # parse "2026-10" into the first moment of that month, and the first moment of the next month
+    try:
+        month_start = datetime.strptime(month, "%Y-%m")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="month must be in YYYY-MM format, e.g. 2026-10")
+    next_month_start = datetime(
+        month_start.year + month_start.month // 12,   # December rolls over to January of next year
+        month_start.month % 12 + 1,
+        1,
+    )
+
+    Entry = models.LedgerEntry
+    Txn = models.Transaction
+
+    def total(entry_type, *conditions):
+        """SUM of entry amounts of one type (CREDIT/DEBIT), optionally limited by extra conditions."""
+        return func.coalesce(
+            func.sum(case((and_(Entry.entry_type == entry_type, *conditions), Entry.amount), else_=0)),
+            0,
+        )
+
+    before_month = Txn.created_at < month_start
+    in_month = and_(Txn.created_at >= month_start, Txn.created_at < next_month_start)
+
+    # ONE query reads the stored balances and the ledger sums together, so Postgres gives
+    # both the same snapshot and a transfer committing mid-report cannot cause a false mismatch.
+    rows = (
+        db.query(
+            models.Account,
+            total(models.EntryType.CREDIT).label("credits_all"),
+            total(models.EntryType.DEBIT).label("debits_all"),
+            total(models.EntryType.CREDIT, before_month).label("credits_before"),
+            total(models.EntryType.DEBIT, before_month).label("debits_before"),
+            total(models.EntryType.CREDIT, in_month).label("credits_month"),
+            total(models.EntryType.DEBIT, in_month).label("debits_month"),
+        )
+        .outerjoin(Entry, Entry.account_id == models.Account.id)
+        .outerjoin(Txn, Entry.transaction_id == Txn.id)
+        .group_by(models.Account.id)
+        .order_by(models.Account.id)
+        .all()
+    )
+
+    accounts_report = []
+    mismatched = 0
+    for account, credits_all, debits_all, credits_before, debits_before, credits_month, debits_month in rows:
+        stored = _money(account.balance)
+        ledger_balance = _money(credits_all) - _money(debits_all)
+        opening = _money(credits_before) - _money(debits_before)
+        month_credits = _money(credits_month)
+        month_debits = _money(debits_month)
+        closing = opening + month_credits - month_debits
+        difference = stored - ledger_balance
+
+        if account.is_system:
+            status = "NOT_COMPARED"       # EXTERNAL's stored balance is not maintained
+        elif difference != 0:
+            status = "MISMATCH"
+            mismatched += 1
+        else:
+            status = "OK"
+
+        if only_discrepancies and status != "MISMATCH":
+            continue
+        accounts_report.append({
+            "account_id": account.id,
+            "owner_name": account.owner_name,
+            "currency": account.currency,
+            "is_system": account.is_system,
+            "opening_balance": str(opening),
+            "total_credits": str(month_credits),
+            "total_debits": str(month_debits),
+            "closing_balance": str(closing),
+            "stored_balance": str(stored),
+            "ledger_balance": str(ledger_balance),
+            "difference": str(difference),     # stored minus ledger; 0.00 when reconciled
+            "status": status,
+        })
+
+    # Transaction check: one row per transaction created in the month. Outer join, so a
+    # transaction with no entries at all is still returned (and flagged).
+    txn_rows = (
+        db.query(
+            Txn.id,
+            Txn.exchange_rate_used,
+            total(models.EntryType.DEBIT).label("debit_total"),
+            total(models.EntryType.CREDIT).label("credit_total"),
+            func.coalesce(func.sum(case((Entry.entry_type == models.EntryType.DEBIT, 1), else_=0)), 0).label("n_debit"),
+            func.coalesce(func.sum(case((Entry.entry_type == models.EntryType.CREDIT, 1), else_=0)), 0).label("n_credit"),
+        )
+        .outerjoin(Entry, Entry.transaction_id == Txn.id)
+        .filter(in_month)
+        .group_by(Txn.id, Txn.exchange_rate_used)
+        .order_by(Txn.id)
+        .all()
+    )
+
+    transaction_discrepancies = []
+    for txn_id, rate, debit_total, credit_total, n_debit, n_credit in txn_rows:
+        debit_total = _money(debit_total)
+        credit_total = _money(credit_total)
+
+        issue = None
+        if n_debit != 1 or n_credit != 1:
+            issue = f"expected exactly 1 debit and 1 credit entry, found {n_debit} debit and {n_credit} credit"
+        elif rate is None:
+            if debit_total != credit_total:
+                issue = "debit and credit amounts differ on a same-currency transaction"
+        else:
+            expected_credit = (debit_total * rate).quantize(CENT, rounding=ROUND_HALF_UP)
+            if abs(credit_total - expected_credit) > CENT:
+                issue = f"credit does not equal debit x exchange rate (expected {expected_credit})"
+
+        if issue:
+            transaction_discrepancies.append({
+                "transaction_id": txn_id,
+                "issue": issue,
+                "debit_total": str(debit_total),
+                "credit_total": str(credit_total),
+                "exchange_rate_used": str(rate) if rate is not None else None,
+            })
+
+    reconciled = mismatched == 0 and not transaction_discrepancies
+    return {
+        "month": month,
+        "period_start": month_start.isoformat(),
+        "period_end_exclusive": next_month_start.isoformat(),
+        "month_has_ended": datetime.now() >= next_month_start,   # false = reconciling a month still in progress
+        "status": "RECONCILED" if reconciled else "DISCREPANCIES_FOUND",
+        "summary": {
+            "accounts_checked": sum(1 for account, *_ in rows if not account.is_system),
+            "accounts_mismatched": mismatched,
+            "transactions_checked": len(txn_rows),
+            "transactions_with_issues": len(transaction_discrepancies),
+        },
+        "accounts": accounts_report,
+        "transaction_discrepancies": transaction_discrepancies,
     }
