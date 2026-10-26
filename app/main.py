@@ -5,20 +5,10 @@ from .database import SessionLocal, engine, Base
 from . import models
 from decimal import Decimal
 from sqlalchemy import func
-import logging
-from prometheus_fastapi_instrumentator import Instrumentator
 
 SUPPORTED_CURRENCIES = ["USD", "SGD"]
 
 app = FastAPI()
-Instrumentator().instrument(app).expose(app)
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
-
 
 # This function gives each request its own database session, and closes it when done
 def get_db():
