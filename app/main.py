@@ -10,14 +10,6 @@ import logging
 SUPPORTED_CURRENCIES = ["USD", "SGD"]
 
 app = FastAPI()
-Instrumentator().instrument(app).expose(app)
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
-
 
 # This function gives each request its own database session, and closes it when done
 def get_db():
