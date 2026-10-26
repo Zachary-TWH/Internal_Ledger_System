@@ -4,5 +4,4 @@ __pycache__/
 *.pyc
 linux.txt
 .vscode/
-*.tfstate.lock.info
 docker-compose.yml
