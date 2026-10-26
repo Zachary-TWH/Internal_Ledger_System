@@ -29,7 +29,6 @@ from typing import Optional, Literal
 from decimal import Decimal
 
 
-
 SUPPORTED_CURRENCIES = ["USD", "SGD"]
 
 app = FastAPI()
@@ -402,13 +401,15 @@ def get_transactions(account_id: int, db: Session = Depends(get_db), page: int =
     else:
         sort_by = (models.Transaction.created_at.desc(), models.LedgerEntry.id.desc())
 
-    entries = db.query(models.LedgerEntry)\
-        .join(models.Transaction, models.LedgerEntry.transaction_id == models.Transaction.id)\
-        .filter(models.LedgerEntry.account_id == account_id)\
-        .order_by(*sort_by)\
-        .offset(offset)\
-        .limit(page_size)\
+    entries = (
+        db.query(models.LedgerEntry)
+        .join(models.Transaction, models.LedgerEntry.transaction_id == models.Transaction.id)
+        .filter(models.LedgerEntry.account_id == account_id)
+        .order_by(*sort_by)
+        .offset(offset)
+        .limit(page_size)
         .all()
+    )
 
     # shape the response: for each entry, return the relevant details
     result = []
