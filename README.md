@@ -35,11 +35,5 @@ Design:
 - **Observability:** log run start, duration, accounts checked and discrepancies found, and expose the result through a read endpoint for the latest run.
 - **How I would test it:** a healthy ledger reports zero discrepancies; manually changing one balance in the database is flagged; running the same month twice gives one result; a worker failure mid-run is retried and completes.
 
-## Future work
 
-- Redis caching for the read endpoints, as described above.
-- Celery-based month-end reconciliation with beat scheduling and run history.
-- Keyset pagination for transaction history, which stays fast and stable on large accounts.
-- Authentication and per-owner access to accounts.
-- Database migrations (Alembic) in place of creating tables at startup.
-- Alerting and metrics on reconciliation results and failed transfers.
+## Credentials: The database password in docker-compose.yml (default postgres, overridable via POSTGRES_PASSWORD) is a demo credential for local use only, so the project runs with no setup. A real deployment would inject secrets from a secrets manager and never commit them.
