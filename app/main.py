@@ -145,7 +145,7 @@ async def deposit(req: DepositRequest, db: Session = Depends(get_db)):
         raise HTTPException(status_code=409, detail="Duplicate request")
 
     # find the EXTERNAL account dynamically instead of hardcoding its id
-    external = db.query(models.Account).filter_by(owner_name="EXTERNAL").first()
+    external = db.query(models.Account).filter_by(owner_name="EXTERNAL", currency=req.currency).first()
     if not external:
         raise HTTPException(status_code=500, detail="EXTERNAL account not configured")
 
@@ -204,7 +204,7 @@ async def withdraw(req: WithdrawalRequest, db: Session = Depends(get_db)):
         raise HTTPException(status_code=409, detail="Duplicate request")
 
     # find the EXTERNAL account dynamically instead of hardcoding its id
-    external = db.query(models.Account).filter_by(owner_name="EXTERNAL").first()
+    external = db.query(models.Account).filter_by(owner_name="EXTERNAL", currency=req.currency).first()
     if not external:
         raise HTTPException(status_code=500, detail="EXTERNAL account not configured")
 
