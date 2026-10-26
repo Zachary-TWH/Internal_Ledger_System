@@ -6,7 +6,6 @@ from . import models
 from decimal import Decimal
 from sqlalchemy import func
 import logging
-from prometheus_fastapi_instrumentator import Instrumentator
 
 SUPPORTED_CURRENCIES = ["USD", "SGD"]
 
