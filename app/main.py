@@ -25,7 +25,7 @@ from . import models
 from decimal import Decimal, ROUND_HALF_UP
 from datetime import datetime
 from sqlalchemy import func, case, and_
-from typing import Optional
+from typing import Optional, Literal
 from decimal import Decimal
 
 
@@ -372,16 +372,17 @@ def get_account(account_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Account not found")
     return account
 
-
 @app.get("/accounts/{account_id}/transactions")
-def get_transactions(account_id: int, db: Session = Depends(get_db), page: int = 1, page_size: int = 20):
+def get_transactions(account_id: int, db: Session = Depends(get_db), page: int = 1, page_size: int = 20, order: Literal["asc", "desc"] = "desc",):
     """Return an account's ledger entries, paginated like a bank statement.
 
-    Query params: page (starts at 1), page_size (default 20).
-    Returns: {"page", "page_size", "results": [{"transaction_id", "entry_type",
-              "amount", "description"}]}
-    Note: no explicit ORDER BY yet, so entries are returned in database order.
-    Errors: 404 account not found
+    Query params: page (starts at 1), page_size (default 20),
+                  order ("desc" = newest first, the default; "asc" = oldest first).
+    Returns: {"page", "page_size", "order", "results": [{"transaction_id", "entry_type",
+              "amount", "description", "created_at"}]}
+    Entries are ordered by the transaction's created_at (stored as UTC), then by entry id,
+    so the order is stable when two entries share the same timestamp and pages never overlap.
+    Errors: 404 account not found, 422 order is not "asc" or "desc"
     """
     # check account exists first
     account = db.query(models.Account).filter_by(id=account_id).first()
@@ -394,8 +395,17 @@ def get_transactions(account_id: int, db: Session = Depends(get_db), page: int =
 
     # fetch this page of ledger entries for the account
     # each entry links to a transaction, so we can see the full history
+    # the timestamp lives on the transaction, so join to it and sort on created_at;
+    # the entry id is the tiebreaker (two entries can share the same created_at)
+    if order == "asc":
+        sort_by = (models.Transaction.created_at.asc(), models.LedgerEntry.id.asc())
+    else:
+        sort_by = (models.Transaction.created_at.desc(), models.LedgerEntry.id.desc())
+
     entries = db.query(models.LedgerEntry)\
-        .filter_by(account_id=account_id)\
+        .join(models.Transaction, models.LedgerEntry.transaction_id == models.Transaction.id)\
+        .filter(models.LedgerEntry.account_id == account_id)\
+        .order_by(*sort_by)\
         .offset(offset)\
         .limit(page_size)\
         .all()
@@ -407,12 +417,14 @@ def get_transactions(account_id: int, db: Session = Depends(get_db), page: int =
             "transaction_id": entry.transaction_id,
             "entry_type": entry.entry_type,   # DEBIT or CREDIT
             "amount": entry.amount,
-            "description": entry.transaction.description  # e.g. "Deposit", "Withdrawal", "Transfer"
+            "description": entry.transaction.description,  # e.g. "Deposit", "Withdrawal", "Transfer"
+            "created_at": entry.transaction.created_at
         })
 
     return {
         "page": page,
         "page_size": page_size,
+        "order": order,
         "results": result
     }
 
