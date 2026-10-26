@@ -8,7 +8,7 @@ from sqlalchemy import func
 import logging
 from prometheus_fastapi_instrumentator import Instrumentator
 
-SUPPORTED_CURRENCIES = ["USD", "EUR", "GBP", "SGD", "JPY"]
+SUPPORTED_CURRENCIES = ["USD", "SGD"]
 
 app = FastAPI()
 Instrumentator().instrument(app).expose(app)
@@ -50,12 +50,12 @@ class DepositRequest(BaseModel):
 
     @field_validator("amount")
     @classmethod
-    def amount_must_be_positive(cls, v):
-        # v is the value of "amount" from the incoming JSON
-        # e.g. v = 100 (valid), v = -50 (invalid), v = 0 (invalid)
-        if v <= 0:
+    def amount_must_be_positive(cls, value):
+        # value is the value of "amount" from the incoming JSON
+        # e.g. value = 100 (valid), value = -50 (invalid), value = 0 (invalid)
+        if value <= 0:
             raise ValueError("Amount must be greater than zero")
-        return v
+        return value
     
 class WithdrawalRequest(BaseModel):
     account_id: int
@@ -64,11 +64,11 @@ class WithdrawalRequest(BaseModel):
 
     @field_validator("amount")
     @classmethod
-    def amount_must_be_positive(cls, v):
-        if v <= 0:
+    def amount_must_be_positive(cls, value):
+        if value <= 0:
             raise ValueError("Amount must be greater than zero")
-        return v
-    
+        return value
+
 class TransferRequest(BaseModel):
     from_account_id: int
     to_account_id: int
@@ -77,10 +77,10 @@ class TransferRequest(BaseModel):
 
     @field_validator("amount")
     @classmethod
-    def amount_must_be_positive(cls, v):
-        if v <= 0:
+    def amount_must_be_positive(cls, value):
+        if value <= 0:
             raise ValueError("Amount must be greater than zero")
-        return v
+        return value
 
 # create a new account
 @app.post("/accounts", response_model=AccountOut)
