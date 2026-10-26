@@ -4,8 +4,5 @@ __pycache__/
 *.pyc
 linux.txt
 .vscode/
-.terraform/
-terraform.tfstate
-terraform.tfstate.backup
 *.tfstate.lock.info
 docker-compose.yml
