@@ -1,3 +1,22 @@
+"""Internal ledger API (FastAPI + SQLAlchemy + Postgres).
+
+Model
+-----
+- Double-entry: every money movement is one Transaction with two LedgerEntry rows
+  (a DEBIT and a CREDIT of the same amount, in each account's own currency).
+- Money enters/leaves the system through a special account named "EXTERNAL".
+  Deposit:  DEBIT EXTERNAL, CREDIT user.   Withdrawal: DEBIT user, CREDIT EXTERNAL.
+- Amounts are Decimal (never float). Only USD and SGD are supported (2 decimal places).
+
+Safety rules used by every write endpoint
+-----------------------------------------
+- Idempotency: each request carries an `idempotency_key`. A key that was already used
+  is rejected with 409, so a retried request cannot move money twice.
+- Row locks: accounts are loaded with SELECT ... FOR UPDATE so concurrent requests on
+  the same account run one at a time and no update is lost.
+- Atomicity: ledger entries and balance changes are committed together (all or nothing).
+"""
+
 from fastapi import FastAPI, Depends, HTTPException
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, field_validator
@@ -11,21 +30,28 @@ SUPPORTED_CURRENCIES = ["USD", "SGD"]
 
 app = FastAPI()
 
-# This function gives each request its own database session, and closes it when done
+
 def get_db():
+    """FastAPI dependency: give each request its own DB session, and always close it."""
     db = SessionLocal()
     try:
         yield db
     finally:
         db.close()
 
-# Pydantic schema: what a "create account" request must look like
+
+# ---------------------------------------------------------------------------
+# Request / response schemas (Pydantic validates incoming JSON against these)
+# ---------------------------------------------------------------------------
+
 class AccountCreate(BaseModel):
+    """Body of POST /accounts."""
     owner_name: str
     currency: str = "USD"
 
-# Pydantic schema: what we send back in the response
+
 class AccountOut(BaseModel):
+    """Account as returned to the client."""
     id: int
     owner_name: str
     currency: str
@@ -34,7 +60,9 @@ class AccountOut(BaseModel):
     class Config:
         from_attributes = True  # lets Pydantic read SQLAlchemy objects directly
 
+
 class DepositRequest(BaseModel):
+    """Body of POST /deposit. `idempotency_key` must be unique per request."""
     account_id: int
     amount: Decimal
     idempotency_key: str
@@ -42,13 +70,15 @@ class DepositRequest(BaseModel):
     @field_validator("amount")
     @classmethod
     def amount_must_be_positive(cls, value):
-        # value is the value of "amount" from the incoming JSON
+        # value is the "amount" from the incoming JSON
         # e.g. value = 100 (valid), value = -50 (invalid), value = 0 (invalid)
         if value <= 0:
             raise ValueError("Amount must be greater than zero")
         return value
-    
+
+
 class WithdrawalRequest(BaseModel):
+    """Body of POST /withdraw. `idempotency_key` must be unique per request."""
     account_id: int
     amount: Decimal
     idempotency_key: str
@@ -60,7 +90,9 @@ class WithdrawalRequest(BaseModel):
             raise ValueError("Amount must be greater than zero")
         return value
 
+
 class TransferRequest(BaseModel):
+    """Body of POST /transfer. `amount` is in the SOURCE account's currency."""
     from_account_id: int
     to_account_id: int
     amount: Decimal
@@ -73,9 +105,17 @@ class TransferRequest(BaseModel):
             raise ValueError("Amount must be greater than zero")
         return value
 
-# create a new account
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
+
 @app.post("/accounts", response_model=AccountOut)
 def create_account(account: AccountCreate, db: Session = Depends(get_db)):
+    """Create a new account with a zero balance.
+
+    Returns the created account (id, owner_name, currency, balance).
+    """
     new_account = models.Account(
         owner_name=account.owner_name,
         currency=account.currency,
@@ -86,12 +126,24 @@ def create_account(account: AccountCreate, db: Session = Depends(get_db)):
     db.refresh(new_account)
     return new_account
 
+
 @app.post("/deposit")
 async def deposit(req: DepositRequest, db: Session = Depends(get_db)):
+    """Add money to an account (money comes in from EXTERNAL).
+
+    Ledger entries: DEBIT EXTERNAL, CREDIT the user's account.
+
+    Returns: {"transaction_id", "new_balance"}
+    Errors:
+      409  idempotency_key was already used
+      404  account not found
+      500  the EXTERNAL account has not been created
+    """
     # idempotency check: has this exact request been processed before?
     existing = db.query(models.Transaction).filter_by(idempotency_key=req.idempotency_key).first()
     if existing:
         raise HTTPException(status_code=409, detail="Duplicate request")
+
     # find the EXTERNAL account dynamically instead of hardcoding its id
     external = db.query(models.Account).filter_by(owner_name="EXTERNAL").first()
     if not external:
@@ -110,7 +162,7 @@ async def deposit(req: DepositRequest, db: Session = Depends(get_db)):
     # two ledger entries: debit EXTERNAL, credit the user's account
     debit_entry = models.LedgerEntry(
         transaction_id=txn.id,
-        account_id=external.id,  # EXTERNAL account
+        account_id=external.id,
         entry_type=models.EntryType.DEBIT,
         amount=req.amount
     )
@@ -122,35 +174,46 @@ async def deposit(req: DepositRequest, db: Session = Depends(get_db)):
     )
     db.add_all([debit_entry, credit_entry])
 
-    # update balances
+    # update balance
     account.balance += req.amount
 
+    # commit everything together atomically: all or nothing
     db.commit()
     db.refresh(account)
     return {"transaction_id": txn.id, "new_balance": account.balance}
 
+
 @app.post("/withdraw")
 async def withdraw(req: WithdrawalRequest, db: Session = Depends(get_db)):
-    # req.idempotency_key = "wdr-001" (from JSON)
+    """Take money out of an account (money goes out to EXTERNAL).
+
+    Ledger entries: DEBIT the user's account, CREDIT EXTERNAL.
+
+    Returns: {"transaction_id", "new_balance"}
+    Errors:
+      409  idempotency_key was already used
+      404  account not found
+      400  insufficient funds
+      500  the EXTERNAL account has not been created
+    """
+    # example values below: req.idempotency_key = "wdr-001", balance = 100, req.amount = 40
+
     # check if this exact request was already processed before
     existing = db.query(models.Transaction).filter_by(idempotency_key=req.idempotency_key).first()
     if existing:
         raise HTTPException(status_code=409, detail="Duplicate request")
-    
 
-        # find the EXTERNAL account dynamically instead of hardcoding its id
+    # find the EXTERNAL account dynamically instead of hardcoding its id
     external = db.query(models.Account).filter_by(owner_name="EXTERNAL").first()
     if not external:
         raise HTTPException(status_code=500, detail="EXTERNAL account not configured")
-
 
     # with_for_update() locks the row so no other transaction can modify it until we commit or rollback
     account = db.query(models.Account).filter_by(id=req.account_id).with_for_update().first()
     if not account:
         raise HTTPException(status_code=404, detail="Account not found")
 
-    # account.balance = 100 (from Postgres), req.amount = 40 (from JSON)
-    # does Alice have enough money to withdraw?
+    # does the account have enough money? (e.g. balance 100 >= amount 40)
     if account.balance < req.amount:
         raise HTTPException(status_code=400, detail="Insufficient funds")
 
@@ -159,55 +222,75 @@ async def withdraw(req: WithdrawalRequest, db: Session = Depends(get_db)):
     db.add(txn)
     db.flush()  # get txn.id without committing yet
 
-    # debit Alice (money leaving her account)
+    # debit the user's account (money leaving the account)
     debit_entry = models.LedgerEntry(
         transaction_id=txn.id,
-        account_id=account.id,          # Alice = id 5
+        account_id=account.id,
         entry_type=models.EntryType.DEBIT,
-        amount=req.amount               # 40
+        amount=req.amount
     )
     # credit EXTERNAL (money leaving the system)
     credit_entry = models.LedgerEntry(
         transaction_id=txn.id,
-        account_id=external.id,  # EXTERNAL account
+        account_id=external.id,
         entry_type=models.EntryType.CREDIT,
-        amount=req.amount               # 40
+        amount=req.amount
     )
     db.add_all([debit_entry, credit_entry])
 
-    # update Alice's balance: 100 - 40 = 60
+    # update balance: 100 - 40 = 60
     account.balance -= req.amount
 
-    # commit everything together atomically — all or nothing
+    # commit everything together atomically: all or nothing
     db.commit()
     db.refresh(account)
     return {"transaction_id": txn.id, "new_balance": account.balance}
 
-@app.post("/transfer")  
+
+@app.post("/transfer")
 async def transfer(req: TransferRequest, db: Session = Depends(get_db)):
+    """Move money from one account to another in a single atomic operation.
+
+    `amount` is in the source account's currency. If the two accounts use different
+    currencies, the latest stored ExchangeRate (source -> destination) converts it,
+    and the destination is credited the converted amount in its own currency.
+
+    Ledger entries: DEBIT source (amount), CREDIT destination (credited_amount).
+
+    Returns: {"transaction_id", "exchange_rate_used" (null if same currency),
+              "from_account_new_balance", "to_account_new_balance"}
+    Errors:
+      409  idempotency_key was already used
+      400  same source and destination account
+      404  an account was not found
+      400  insufficient funds in the source account
+      400  no exchange rate stored for the currency pair
+    """
     # check if this exact transfer was already processed before
     existing = db.query(models.Transaction).filter_by(idempotency_key=req.idempotency_key).first()
     if existing:
         raise HTTPException(status_code=409, detail="Duplicate request")
-    
+
     # prevent transferring to yourself
     if req.from_account_id == req.to_account_id:
         raise HTTPException(status_code=400, detail="Cannot transfer to the same account")
 
     # always lock in consistent id order to prevent deadlocks
+    # (e.g. A->B and B->A at the same time both lock the lower id first)
     lock_first_id = min(req.from_account_id, req.to_account_id)
     lock_second_id = max(req.from_account_id, req.to_account_id)
-    
+
     first = db.query(models.Account).filter_by(id=lock_first_id).with_for_update().first()
     second = db.query(models.Account).filter_by(id=lock_second_id).with_for_update().first()
 
     if not first or not second:
         raise HTTPException(status_code=404, detail="Account not found")
 
+    # map the locked rows back to source and destination
     from_account = first if first.id == req.from_account_id else second
     to_account = second if second.id == req.to_account_id else first
 
-    # does Alice have enough money to send? (checked in from_account's own currency, before conversion)
+    # does the source have enough money? (checked in the source's own currency, before conversion)
     if from_account.balance < req.amount:
         raise HTTPException(status_code=400, detail="Insufficient funds")
 
@@ -240,14 +323,14 @@ async def transfer(req: TransferRequest, db: Session = Depends(get_db)):
     db.add(txn)
     db.flush()  # get txn.id without committing yet
 
-    # debit Alice, in her own currency
+    # debit the source, in its own currency
     debit_entry = models.LedgerEntry(
         transaction_id=txn.id,
         account_id=from_account.id,
         entry_type=models.EntryType.DEBIT,
         amount=req.amount
     )
-    # credit Bob, in his own currency (converted, if currencies differ)
+    # credit the destination, in its own currency (converted, if currencies differ)
     credit_entry = models.LedgerEntry(
         transaction_id=txn.id,
         account_id=to_account.id,
@@ -260,6 +343,7 @@ async def transfer(req: TransferRequest, db: Session = Depends(get_db)):
     from_account.balance -= req.amount
     to_account.balance += credited_amount
 
+    # commit everything together atomically: all or nothing
     db.commit()
     db.refresh(from_account)
     db.refresh(to_account)
@@ -270,17 +354,29 @@ async def transfer(req: TransferRequest, db: Session = Depends(get_db)):
         "to_account_new_balance": to_account.balance
     }
 
-# fetch account details (always read from the database)
+
 @app.get("/accounts/{account_id}", response_model=AccountOut)
 def get_account(account_id: int, db: Session = Depends(get_db)):
+    """Return one account and its current balance (always read from the database).
+
+    Errors: 404 account not found
+    """
     account = db.query(models.Account).filter_by(id=account_id).first()
     if not account:
         raise HTTPException(status_code=404, detail="Account not found")
     return account
 
-# fetch all transactions for a given account, with pagination like statements
+
 @app.get("/accounts/{account_id}/transactions")
-def get_transactions(account_id: int, db: Session = Depends(get_db), page : int = 1, page_size: int = 20):
+def get_transactions(account_id: int, db: Session = Depends(get_db), page: int = 1, page_size: int = 20):
+    """Return an account's ledger entries, paginated like a bank statement.
+
+    Query params: page (starts at 1), page_size (default 20).
+    Returns: {"page", "page_size", "results": [{"transaction_id", "entry_type",
+              "amount", "description"}]}
+    Note: no explicit ORDER BY yet, so entries are returned in database order.
+    Errors: 404 account not found
+    """
     # check account exists first
     account = db.query(models.Account).filter_by(id=account_id).first()
     if not account:
@@ -290,7 +386,7 @@ def get_transactions(account_id: int, db: Session = Depends(get_db), page : int 
     # page 1: skip 0, page 2: skip 20, page 3: skip 40
     offset = (page - 1) * page_size
 
-    # fetch all ledger entries for this account
+    # fetch this page of ledger entries for the account
     # each entry links to a transaction, so we can see the full history
     entries = db.query(models.LedgerEntry)\
         .filter_by(account_id=account_id)\
@@ -298,7 +394,7 @@ def get_transactions(account_id: int, db: Session = Depends(get_db), page : int 
         .limit(page_size)\
         .all()
 
-    # shape the response — for each entry, return the relevant details
+    # shape the response: for each entry, return the relevant details
     result = []
     for entry in entries:
         result.append({
