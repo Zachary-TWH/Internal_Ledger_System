@@ -25,7 +25,7 @@ from . import models
 from decimal import Decimal, ROUND_HALF_UP
 from datetime import datetime
 from sqlalchemy import func, case, and_
-from typing import Optional, Literal
+from typing import Literal
 from decimal import Decimal
 
 
