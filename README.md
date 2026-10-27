@@ -198,7 +198,8 @@ It compares each account's stored balance with its ledger entries (credits minus
 - Not implemented: saving each run in a `reconciliation_runs` table for an audit trail, and the scheduled job.
 
 **6. Tests.**
-- File: `tests/test_reconciliation_endpoint.py`.
+- File: `tests/test_ledger_endpoints.py`. It covers `/deposit`, `/withdraw`, `/transfer` and the reconciliation endpoint.
+- Concurrency (row locks) is not covered, because SQLite ignores `SELECT ... FOR UPDATE`.
 - They use a temporary SQLite database, so no Postgres is needed.
 - Run: `pip install pytest httpx`, then `pytest tests/`.
 
