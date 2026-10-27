@@ -4,14 +4,21 @@
 
 Each assumption below is a rule the ledger follows. Examples use made-up numbers.
 
-**1. Money is an exact decimal, never a float.**
-- Python `Decimal` in code, `Numeric(18,2)` in Postgres.
-- Example: 0.10 + 0.20 is exactly 0.30, not 0.30000000000000004.
-- The API accepts amounts as `Decimal`. Reconciliation returns amounts as strings.
+**1. Money and decimal precision.**
+- Money uses exact decimal arithmetic, never binary floating-point.
+- Python uses `Decimal` for monetary calculations. PostgreSQL uses `NUMERIC(18,2)` for stored monetary amounts.
+- Example: `Decimal("0.10") + Decimal("0.20")` produces exactly `0.30`.
+- The API accepts monetary amounts as decimal values, preferably supplied as JSON strings to avoid floating-point conversion before validation.
+- Reconciliation responses represent monetary amounts as strings to preserve their exact decimal representation.
+- Rounding uses `ROUND_HALF_UP` at explicitly defined calculation or posting boundaries.
+- Monetary calculations should retain sufficient precision until the applicable boundary. Amounts must not be rounded arbitrarily at every intermediate step.
 
-**2. Only USD and SGD are supported, both with 2 decimal places.**
-- One scale and one rounding rule (round half up) cover every amount.
-- IDR (no usable minor unit) and KRW or JPY (0 decimals) need a per-currency scale. That adds complexity, so they are out of scope.
+**2. Supported currencies.**
+- Currently supported currencies are USD and SGD.
+- Both use two decimal places, so `NUMERIC(18,2)` is sufficient for stored monetary amounts within the supported range.
+- Additional currencies are not currently supported.
+- Currencies such as KRW and JPY, which commonly use zero-decimal payment amounts, and IDR, which commonly uses whole-rupiah amounts, require currency-specific precision and validation rules.
+- Support can be added by introducing currency-specific metadata and business rules.
 
 **3. Each account has one fixed currency.**
 - Set at creation, never changed.
