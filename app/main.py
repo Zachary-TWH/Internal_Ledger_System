@@ -57,12 +57,11 @@ FX_TIMEOUT_SECONDS = 5
 
 
 class FxRateError(Exception):
-    """The live FX rate could not be obtained. `timed_out` is True when the service was too slow."""
+    """The live FX rate could not be obtained (pass or fail: no distinction between causes)."""
 
-    def __init__(self, message: str, timed_out: bool = False):
+    def __init__(self, message: str):
         super().__init__(message)
         self.message = message
-        self.timed_out = timed_out
 
 
 def fetch_fx_rate(from_currency: str, to_currency: str):
@@ -82,15 +81,9 @@ def fetch_fx_rate(from_currency: str, to_currency: str):
             payload = json.loads(response.read().decode("utf-8"), parse_float=Decimal)
         rate = Decimal(str(payload["rates"][to_currency])).quantize(Decimal("0.000001"))
         rate_date = payload.get("date")
-    except TimeoutError:
-        raise FxRateError("FX rate service timed out", timed_out=True)
-    except urllib.error.URLError as exc:
-        # URLError covers HTTPError (non-2xx) and network failures; a connect timeout lands here too
-        if isinstance(getattr(exc, "reason", None), TimeoutError):
-            raise FxRateError("FX rate service timed out", timed_out=True)
-        raise FxRateError("FX rate service unavailable")
-    except (KeyError, ValueError, TypeError, ArithmeticError):
-        raise FxRateError("FX rate service returned an unexpected response")
+    except (urllib.error.URLError, TimeoutError, KeyError, ValueError, TypeError, ArithmeticError):
+        # any failure (slow past FX_TIMEOUT_SECONDS, unreachable, HTTP error, bad response) means reject
+        raise FxRateError("FX rate service unavailable or returned a bad response")
 
     if rate <= 0:
         raise FxRateError("FX rate service returned an invalid rate")
@@ -824,7 +817,7 @@ def fx_convert(from_currency: str, to_currency: str, amount: Decimal = Decimal("
     try:
         rate, rate_date = fetch_fx_rate(from_currency, to_currency)
     except FxRateError as exc:
-        raise HTTPException(status_code=504 if exc.timed_out else 502, detail=exc.message)
+        raise HTTPException(status_code=503, detail=exc.message)
 
     converted = (amount * rate).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
     return {
