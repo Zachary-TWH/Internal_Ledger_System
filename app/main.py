@@ -25,7 +25,7 @@ import urllib.request
 from fastapi import FastAPI, Depends, HTTPException
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, field_validator
-from .database import SessionLocal, engine, Base
+from .database import SessionLocal
 from . import models
 from decimal import Decimal, ROUND_HALF_UP
 from datetime import datetime
@@ -84,7 +84,8 @@ def fetch_fx_rate(from_currency: str, to_currency: str):
 
 app = FastAPI()
 
-Base.metadata.create_all(bind=engine)
+# Tables are created by app/create_table.py (run by entrypoint.sh before the API starts),
+# not here. Outside Docker, run `python -m app.create_table` once first.
 
 def get_db():
     """FastAPI dependency: give each request its own DB session, and always close it."""
