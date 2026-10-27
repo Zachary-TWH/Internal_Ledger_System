@@ -22,6 +22,8 @@ Each assumption below is a rule the ledger follows. Examples use made-up numbers
 
 **3. Each account has one fixed currency.**
 - Set at creation, never changed.
+- `POST /accounts` only accepts a supported currency (USD or SGD, case-insensitive) and rejects anything else with 422, because other currencies have no system accounts and could never be funded.
+- `GET /accounts/{id}` returns `balance` as a string such as `"60.00"`, so no precision is lost.
 - Example: account 3 is SGD, so every entry on it is in SGD.
 
 **4. Every movement is double-entry.**
@@ -88,6 +90,7 @@ Each assumption below is a rule the ledger follows. Examples use made-up numbers
 - A unique constraint on the key is the final guard.
 - A reused key returns 409 and moves no money.
 - Example: a client retries `transfer-001` after a timeout. The second call is rejected, so the money moves once.
+- Two identical requests arriving at the same moment can both pass the up-front check. The unique constraint then rejects the loser, and the API turns that into the same clean 409 (never a 500). `test_identical_simultaneous_requests_move_money_once` checks exactly one 200 and nine 409s.
 - Limit: the 409 does not return the original result, and it does not check whether the retry had the same details.
 
 **12. Timestamps use the database server clock.**

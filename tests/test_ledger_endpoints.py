@@ -113,7 +113,7 @@ def post_transfer(src, dst, amount, key):
 
 
 def balance_of(account_id):
-    return client.get(f"/accounts/{account_id}").json()["balance"]
+    return Decimal(client.get(f"/accounts/{account_id}").json()["balance"])
 
 
 def count_rows(model):
@@ -528,7 +528,7 @@ def test_transfer_cross_currency_returns_503_when_rate_service_is_down():
     # the failed request left nothing behind, so the same key works once the service is back
     FAKE_RATES[("SGD", "USD")] = Decimal("0.740000")
     assert post_transfer(bob_sgd, alice, 10, "t1").status_code == 200
-    assert balance_of(bob_sgd) == 90 and balance_of(alice) == 7.4          # 10 SGD x 0.74
+    assert balance_of(bob_sgd) == 90 and balance_of(alice) == Decimal("7.40")          # 10 SGD x 0.74
 
 
 def test_same_currency_transfer_never_calls_the_rate_service():
@@ -582,10 +582,23 @@ def test_get_account_returns_balance_and_currency():
     bob_sgd = new_account("bob", "SGD")
 
     body = client.get(f"/accounts/{bob_sgd}").json()
-    assert body == {"id": bob_sgd, "owner_name": "bob", "currency": "SGD", "balance": 0}
+    # the balance is a string, so no precision is lost
+    assert body == {"id": bob_sgd, "owner_name": "bob", "currency": "SGD", "balance": "0.00"}
 
     deposit(bob_sgd, 100, "d1")
-    assert client.get(f"/accounts/{bob_sgd}").json()["balance"] == 100
+    assert client.get(f"/accounts/{bob_sgd}").json()["balance"] == "100.00"
+
+
+def test_create_account_rejects_unsupported_currency():
+    r = client.post("/accounts", json={"owner_name": "eve", "currency": "EUR"})
+    assert r.status_code == 422
+    assert count_rows(models.Account) == 4        # only the four system accounts exist
+
+
+def test_create_account_accepts_lowercase_currency():
+    r = client.post("/accounts", json={"owner_name": "eve", "currency": "sgd"})
+    assert r.status_code == 200
+    assert r.json()["currency"] == "SGD"
 
 
 def test_get_account_unknown_returns_404():

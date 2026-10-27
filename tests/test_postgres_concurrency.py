@@ -82,7 +82,7 @@ def transfer(src, dst, amount, key):
 
 
 def balance_of(account_id):
-    return get(f"/accounts/{account_id}").json()["balance"]
+    return Decimal(get(f"/accounts/{account_id}").json()["balance"])
 
 
 def system_balance(owner_name, currency):
@@ -162,8 +162,8 @@ def test_identical_simultaneous_requests_move_money_once():
     responses = run_parallel([lambda: deposit(alice, 50, "same-key") for _ in range(10)])
 
     # Exactly one request wins. The others are duplicates; the unique constraint on the
-    # idempotency key is what stops them, whatever status code they end up with.
-    assert statuses(responses).count(200) == 1
+    # idempotency key stops them, and every loser gets a clean 409 (never a 500).
+    assert statuses(responses) == [200] + [409] * 9
     assert balance_of(alice) == 50
     db = SessionLocal()
     rows = db.query(models.Transaction).filter_by(idempotency_key="same-key").count()
@@ -216,7 +216,7 @@ def test_converted_amount_is_rounded_to_cents(amount, expected_sgd):
     r = transfer(alice, bob_sgd, amount, "t1")
 
     assert r.status_code == 200, r.text
-    assert balance_of(bob_sgd) == float(expected_sgd)
+    assert balance_of(bob_sgd) == Decimal(expected_sgd)
     db = SessionLocal()
     credit = db.query(models.LedgerEntry).filter_by(account_id=bob_sgd).one()
     db.close()

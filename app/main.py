@@ -111,6 +111,32 @@ def get_db():
         db.close()
 
 
+def flush_or_409(db: Session):
+    """Send the pending INSERTs to the database, turning a duplicate idempotency_key into a 409."""
+    try:
+        db.flush()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Duplicate request")
+
+
+def commit_or_409(db: Session):
+    """Commit, turning a duplicate idempotency_key into a clean 409.
+
+    The idempotency check at the top of each endpoint runs before any lock, so two identical
+    requests arriving together can both pass it. The UNIQUE constraint on
+    transactions.idempotency_key then rejects the second one, at the flush that inserts the
+    transaction (Postgres makes it wait for the first request to finish, then fail) or at the
+    commit. Either way roll it back and answer 409, the same answer a retry after the first
+    finished gets, instead of a 500.
+    """
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Duplicate request")
+
+
 def lock_system_account(db: Session, owner_name: str, currency: str) -> models.Account:
     """Load one system account (EXTERNAL or FX_POSITION) with a row lock, or fail with 500.
 
@@ -137,13 +163,23 @@ class AccountCreate(BaseModel):
     owner_name: str
     currency: str = "USD"
 
+    @field_validator("currency")
+    @classmethod
+    def currency_must_be_supported(cls, value):
+        # Only currencies with EXTERNAL and FX_POSITION system accounts can be used. Accepting
+        # anything else (e.g. EUR) would create an account that can never be deposited into.
+        value = value.upper()
+        if value not in SUPPORTED_CURRENCIES:
+            raise ValueError(f"Unsupported currency. Supported: {', '.join(SUPPORTED_CURRENCIES)}")
+        return value
+
 
 class AccountOut(BaseModel):
     """Account as returned to the client."""
     id: int
     owner_name: str
     currency: str
-    balance: float
+    balance: Decimal  # serialised as a string, e.g. "60.00", so no precision is lost
 
     class Config:
         from_attributes = True  # lets Pydantic read SQLAlchemy objects directly
@@ -254,7 +290,7 @@ def deposit(req: DepositRequest, db: Session = Depends(get_db)):
         description="Deposit",
     )
     db.add(txn)
-    db.flush()  # gets txn.id without committing yet
+    flush_or_409(db)  # gets txn.id without committing yet
 
     # two ledger entries: debit EXTERNAL, credit the user's account
     debit_entry = models.LedgerEntry(
@@ -276,7 +312,7 @@ def deposit(req: DepositRequest, db: Session = Depends(get_db)):
     external.balance -= req.amount
 
     # commit everything together atomically: all or nothing
-    db.commit()
+    commit_or_409(db)
     db.refresh(account)
     return {"transaction_id": txn.id, "new_balance": account.balance}
 
@@ -321,7 +357,7 @@ def withdraw(req: WithdrawalRequest, db: Session = Depends(get_db)):
         description="Withdrawal",
     )
     db.add(txn)
-    db.flush()  # get txn.id without committing yet
+    flush_or_409(db)  # get txn.id without committing yet
 
     # debit the user's account (money leaving the account)
     debit_entry = models.LedgerEntry(
@@ -344,7 +380,7 @@ def withdraw(req: WithdrawalRequest, db: Session = Depends(get_db)):
     external.balance += req.amount
 
     # commit everything together atomically: all or nothing
-    db.commit()
+    commit_or_409(db)
     db.refresh(account)
     return {"transaction_id": txn.id, "new_balance": account.balance}
 
@@ -467,7 +503,7 @@ def transfer(req: TransferRequest, db: Session = Depends(get_db)):
         exchange_rate_used=exchange_rate_used
     )
     db.add(txn)
-    db.flush()  # get txn.id without committing yet
+    flush_or_409(db)  # get txn.id without committing yet
 
     def entry(account, entry_type, amount):
         return models.LedgerEntry(
@@ -497,7 +533,7 @@ def transfer(req: TransferRequest, db: Session = Depends(get_db)):
     to_account.balance += credited_amount
 
     # commit everything together atomically: all or nothing
-    db.commit()
+    commit_or_409(db)
     db.refresh(from_account)
     db.refresh(to_account)
     return {
@@ -604,7 +640,7 @@ def reverse_transaction(transaction_id: int, req: ReversalRequest, db: Session =
         exchange_rate_used=original.exchange_rate_used,
     )
     db.add(reversal)
-    db.flush()  # get reversal.id without committing yet
+    flush_or_409(db)  # get reversal.id without committing yet
 
     # one offsetting entry per original entry: same account, same amount, opposite direction
     reversed_entries = []
