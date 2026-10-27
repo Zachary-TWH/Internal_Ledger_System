@@ -183,7 +183,7 @@ def create_account(account: AccountCreate, db: Session = Depends(get_db)):
 
 
 @app.post("/deposit")
-async def deposit(req: DepositRequest, db: Session = Depends(get_db)):
+def deposit(req: DepositRequest, db: Session = Depends(get_db)):
     """Add money to an account (money comes in from EXTERNAL).
 
     Ledger entries: DEBIT EXTERNAL, CREDIT the user's account.
@@ -239,7 +239,7 @@ async def deposit(req: DepositRequest, db: Session = Depends(get_db)):
 
 
 @app.post("/withdraw")
-async def withdraw(req: WithdrawalRequest, db: Session = Depends(get_db)):
+def withdraw(req: WithdrawalRequest, db: Session = Depends(get_db)):
     """Take money out of an account (money goes out to EXTERNAL).
 
     Ledger entries: DEBIT the user's account, CREDIT EXTERNAL.
@@ -303,7 +303,7 @@ async def withdraw(req: WithdrawalRequest, db: Session = Depends(get_db)):
 
 
 @app.post("/transfer")
-async def transfer(req: TransferRequest, db: Session = Depends(get_db)):
+def transfer(req: TransferRequest, db: Session = Depends(get_db)):
     """Move money from one account to another in a single atomic operation.
 
     `amount` is in the source account's currency. If the two accounts use different
