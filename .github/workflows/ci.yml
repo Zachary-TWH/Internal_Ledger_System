@@ -1,0 +1,83 @@
+name: CI/CD
+
+# Runs on every push to main and on every pull request.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # Stage 1 (CI): unit/endpoint tests. They use a temporary SQLite file, so no database service is needed.
+  test:
+    name: Run tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt pytest httpx
+
+      - name: Run pytest
+        run: pytest tests/ -v
+
+  # Stage 2 (CI): build the images, start Postgres + API with Docker Compose,
+  # and check the API answers and the EXTERNAL system accounts were created.
+  docker-smoke-test:
+    name: Docker Compose smoke test
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and start the stack
+        run: docker compose up -d --build
+
+      - name: Wait for the API
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8000/docs > /dev/null; then
+              echo "API is up"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "API did not become ready in 60 seconds"
+          exit 1
+
+      - name: Create an account and deposit (proves EXTERNAL accounts exist)
+        run: |
+          curl -sf -X POST http://localhost:8000/accounts \
+            -H "Content-Type: application/json" \
+            -d '{"owner_name": "ci-smoke", "currency": "USD"}'
+          echo
+          curl -sf -X POST http://localhost:8000/deposit \
+            -H "Content-Type: application/json" \
+            -d '{"account_id": 1, "amount": 100, "idempotency_key": "ci-smoke-1"}'
+          echo
+
+      - name: Show logs on failure
+        if: failure()
+        run: docker compose logs
+
+      - name: Stop the stack
+        if: always()
+        run: docker compose down -v
+
+  # Stage 3 (CD, simulated): runs only on pushes to main, after both CI stages pass.
+  # No real deployment target exists, so this step only prints what a deploy would do.
+  deploy:
+    name: Deploy (simulated)
+    runs-on: ubuntu-latest
+    needs: [test, docker-smoke-test]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    steps:
+      - name: Simulate deployment
+        run: |
+          echo "Tests and smoke test passed for commit $GITHUB_SHA"
+          echo "A real pipeline would push the Docker image to a registry and roll it out here."

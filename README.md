@@ -198,9 +198,15 @@ It compares each account's stored balance with its ledger entries (credits minus
 - Not implemented: saving each run in a `reconciliation_runs` table for an audit trail, and the scheduled job.
 
 **6. Tests.**
-- File: `tests/test_month_end_reconciliation.py`.
+- File: `tests/test_reconciliation_endpoint.py`.
 - They use a temporary SQLite database, so no Postgres is needed.
 - Run: `pip install pytest httpx`, then `pytest tests/`.
+
+**7. CI/CD pipeline.**
+- File: `.github/workflows/ci.yml`. Runs on every push to `main` and every pull request.
+- **Stage 1, tests:** `pytest tests/` on Python 3.14.
+- **Stage 2, Docker smoke test:** `docker compose up`, wait for `/docs`, create an account, deposit 100. The deposit fails if the EXTERNAL accounts were not seeded.
+- **Stage 3, deploy (simulated):** only on `main`, only after stages 1 and 2 pass. It prints what a real deploy would do. There is no real target.
 
 ## Running it
 

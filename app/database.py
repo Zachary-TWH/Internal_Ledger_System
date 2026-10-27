@@ -36,6 +36,11 @@ if not DATABASE_URL:
 # The engine owns a pool of database connections and is created once per process.
 # pool_pre_ping tests a pooled connection before using it, so a connection dropped
 # by a database restart is replaced instead of failing the request.
+# requirements.txt installs psycopg 3, but a plain "postgresql://" URL makes SQLAlchemy
+# look for psycopg2. Name the psycopg 3 driver explicitly so either URL form works.
+if DATABASE_URL.startswith("postgresql://"):
+    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
+
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 
 # Factory for sessions. A session is a short-lived unit of work: it borrows a

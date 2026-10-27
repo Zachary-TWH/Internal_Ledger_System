@@ -7,7 +7,7 @@ Run from the repo root:  pytest tests/
 
 import os
 import tempfile
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 
 _db_file = os.path.join(tempfile.mkdtemp(), "test_ledger.db")
@@ -21,7 +21,9 @@ from app.database import SessionLocal, Base, engine
 from app import models
 
 client = TestClient(app)
-THIS_MONTH = datetime.now().strftime("%Y-%m")
+# Transactions are stamped by the database clock (UTC), so use UTC here too. A local
+# clock can name a different month near midnight on the 1st and make the tests flaky.
+THIS_MONTH = datetime.now(timezone.utc).strftime("%Y-%m")
 
 
 @pytest.fixture(autouse=True)
