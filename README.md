@@ -78,29 +78,160 @@ Each assumption below is a rule the ledger follows. Examples use made-up numbers
 
 ## Caching (not implemented)
 
-Reading an account's balance and transaction history is a good candidate for caching, since these are read far more often than they change. This is **not implemented** to keep the ledger simple. I would use Redis to store recent reads for a short time, and clear an account's cached data whenever a deposit, withdrawal or transfer changes it. Money-moving code would always read the balance directly from the database, so a stale cached value could never cause an overdraft. The trade-off is that a displayed balance may be a few seconds out of date.
+Balance and history reads are a good fit for caching. This is **not implemented** to keep the ledger simple.
 
-## Month-end reconciliation
+**1. What would be cached.**
+- `GET /accounts/{id}` and `GET /accounts/{id}/transactions`.
+- These are read far more often than they change.
 
-Month-end reconciliation compares each account's stored balance against the sum of its ledger entries (credits minus debits) and reports any account where they differ. It is exposed as an API endpoint that takes a month, so it can be triggered on demand. In a real system the same function would be called automatically by a scheduled job at the end of each month. The check only reports discrepancies and never edits balances, since a real error should be fixed with a new, auditable ledger transaction.
+**2. Where.**
+- Redis, with a short expiry (for example 5 seconds).
+- Example key: `balance:42`.
 
-**Endpoint:** `GET /reconciliation/month-end?month=YYYY-MM` (optional `only_discrepancies=true` to list only failing accounts). It returns HTTP 200 even when discrepancies exist, so read the `status` field (`RECONCILED` or `DISCREPANCIES_FOUND`). An invalid month returns 400.
+**3. How it stays fresh.**
+- **Step 1:** first read of account 42 misses the cache, reads Postgres, stores `balance:42 = 100.00`.
+- **Step 2:** a deposit of 50 on account 42 commits.
+- **Step 3:** the app deletes `balance:42`.
+- **Step 4:** the next read misses, reads 150.00 from Postgres, stores it again.
 
-**Check 1, accounts.** For every account it returns `opening_balance` (ledger balance before the month), the month's `total_credits` and `total_debits`, `closing_balance` (ledger balance at the end of the month), and the `stored_balance`. The stored balance is compared with the ledger balance over **all** entries, because `accounts.balance` is only a live balance with no month-end snapshot. `difference` is stored minus ledger, so `0.00` means reconciled. For a past month the stored balance will not equal that month's `closing_balance` if later transactions exist, which is expected. The stored balance and the ledger sums are read in a single SQL statement, so one consistent snapshot is compared and a transfer committing mid-report cannot cause a false mismatch.
+**4. Money-moving code never reads the cache.**
+- Scenario: the cache says 100.00, the real balance is 20.00, and a withdrawal of 80 arrives.
+- **Wrong:** read 100.00 from the cache, allow the withdrawal, overdraw the account by 60.
+- **Correct:** lock the row and read 20.00 from Postgres, reject with "Insufficient funds".
+- So a stale cache can never cause an overdraft.
 
-**Check 2, transactions created in the month.** Each must have exactly one DEBIT and one CREDIT entry. A same-currency transaction needs debit = credit. A cross-currency transaction needs credit = debit x `exchange_rate_used`, rounded to 2 decimals (0.01 tolerance). This replaces a single "total debits equal total credits" check across the whole ledger, because that sum is not equal once a USD to SGD transfer exists: the debit is in USD and the credit is in SGD, so the raw numbers differ by design.
+**5. Trade-off.**
+- A displayed balance can be a few seconds out of date.
+- At this scale Postgres handles the read load, so the extra moving part is not worth it yet.
 
-**Assumptions and limits.**
-- The EXTERNAL system accounts are listed (`status: NOT_COMPARED`) but not compared, since deposits and withdrawals do not update the EXTERNAL stored balance. Their ledger balance is the net money that entered or left the system.
-- `created_at` is stored without a timezone, so month boundaries follow the database server's clock. Run the database in UTC.
+## Reversals (not implemented)
+
+There is no reversal endpoint. This is how I would add one.
+
+**1. A reversal is a new transaction. The original is never edited.**
+- Add `transactions.type` (`transfer`, `deposit`, `withdrawal`, `reversal`).
+- Add `transactions.reversal_of`, a nullable foreign key to the original, with a unique constraint.
+- The unique constraint is what stops a second reversal, even under concurrent requests.
+
+**2. It flips the original entries using the original stored amounts and rate.**
+- Scenario: A sends 100 USD to B at rate 1.35, so B receives 135.00 SGD. Then the rate changes to 1.40.
+- **Wrong:** reverse with today's rate. B pays back 135.00 SGD, A receives 135 / 1.40 = 96.43 USD, and A is short 3.57 USD.
+- **Correct:** reverse with the stored amounts. B pays back 135.00 SGD, A receives exactly 100.00 USD.
+
+**3. Guards.**
+- Unknown transaction: 404.
+- Already reversed: 409 (from the unique constraint).
+- Reversing a reversal: 400.
+- Recipient already spent the money: 400, balance too low. A real system would use a dispute or compensating process.
+- Takes an `idempotency_key` like every other write.
+
+**4. How I would test it.**
+- Deposit 100 into A, transfer 40 to B, reverse the transfer. Expect A = 100.00 and B = 0.00.
+- Reverse the same transaction again. Expect 409.
+- Repeat with a cross-currency transfer and a changed rate. Expect exact original amounts back.
+
+## Total-money integrity check (not implemented)
+
+Month-end reconciliation covers part of this. A full "does all the money add up" check needs a design change first.
+
+**1. Why it cannot be done today.**
+- Money must net to zero **per currency**, not across currencies.
+- A cross-currency transfer is currently two entries: debit 100 USD, credit 135 SGD.
+- USD totals -100 and SGD totals +135. Neither nets to zero.
+
+**2. The fix: one FX account per currency.**
+- A cross-currency transfer becomes four entries.
+- **USD side:** A -100.00, FX_USD +100.00. Net 0.
+- **SGD side:** FX_SGD -135.00, B +135.00. Net 0.
+- The FX balances show how much of each currency the system has bought or sold.
+- Rounding differences also land in the FX accounts.
+
+**3. The check itself.**
+- `GET /integrity` returns, per currency, total debits, total credits and the sum of all balances.
+- It also confirms every transaction nets to zero per currency.
+- Result is `PASS` or `FAIL` with the numbers.
+
+**4. Trade-off.**
+- FX accounts become hot rows under heavy cross-currency load, because every such transfer locks them.
+- A fix is to split each FX account into several sub-accounts and sum them.
+
+**5. How I would test it.**
+- Healthy data: expect `PASS` in both currencies.
+- Change one account balance by hand: expect `FAIL`.
+
+## Month-end reconciliation (implemented)
+
+It compares each account's stored balance with its ledger entries (credits minus debits). It only reports. It never edits balances, because a real error should be fixed with a new, auditable ledger transaction.
+
+**1. Endpoint.**
+- `GET /reconciliation/month-end?month=YYYY-MM`
+- Optional `only_discrepancies=true` lists only failing accounts.
+- Returns HTTP 200 even when discrepancies exist. Read the `status` field: `RECONCILED` or `DISCREPANCIES_FOUND`.
+- An invalid month returns 400.
+- In a real system a scheduled job would call the same function on the 1st of each month.
+
+**2. Check 1: accounts.**
+- Per account it returns `opening_balance`, `total_credits`, `total_debits`, `closing_balance` and `stored_balance`.
+- `difference` is stored minus ledger. `0.00` means reconciled.
+- Example, account 7 in 2026-10: opening 0.00, credits 100.00, debits 30.00, closing 70.00.
+- Stored balance 70.00 gives difference 0.00, status `OK`.
+- If someone sets the stored balance to 75.00, the difference is 5.00 and the status is `MISMATCH`.
+- The stored balance is compared with the ledger over **all** entries, because `accounts.balance` is a live balance with no month-end snapshot.
+- So for a past month, stored will not equal that month's `closing_balance` if later transactions exist. That is expected.
+
+**3. Check 2: transactions created in the month.**
+- Each must have exactly one DEBIT and one CREDIT entry.
+- Same currency: debit = credit.
+- Cross currency: credit = debit x `exchange_rate_used`, rounded to 2 decimals, with 0.01 tolerance.
+- Example: debit 100.00 USD at rate 1.35 expects credit 135.00 SGD. A credit of 130.00 is flagged.
+- This replaces one "total debits = total credits" check, which fails by design once a USD to SGD transfer exists.
+
+**4. No false alarms from live traffic.**
+- Stored balances and ledger sums are read in one SQL statement.
+- Postgres gives both the same snapshot, so a transfer committing mid-report cannot cause a false mismatch.
+
+**5. Assumptions and limits.**
+- EXTERNAL accounts are listed as `NOT_COMPARED`. Deposits and withdrawals do not update their stored balance. Their ledger balance is the net money that entered or left the system.
+- `created_at` has no timezone, so month boundaries follow the database server clock. Run the database in UTC.
 - Amounts are returned as 2-decimal strings, not floats, so rounding cannot hide a difference.
-- A month that has not ended yet can be reconciled; the response sets `month_has_ended: false`.
-- Not implemented: storing each run's result (a `reconciliation_runs` table) for an audit trail, and the scheduled job that calls it on the 1st of each month.
+- A month that has not ended can be reconciled. The response sets `month_has_ended: false`.
+- Not implemented: saving each run in a `reconciliation_runs` table for an audit trail, and the scheduled job.
 
-Tests are in `tests/test_month_end_reconciliation.py` and use a temporary SQLite database, so they need no Postgres: `pip install pytest httpx` then `pytest tests/`.
+**6. Tests.**
+- File: `tests/test_month_end_reconciliation.py`.
+- They use a temporary SQLite database, so no Postgres is needed.
+- Run: `pip install pytest httpx`, then `pytest tests/`.
 
-## Credentials: The database password in docker-compose.yml (default postgres, overridable via POSTGRES_PASSWORD) is a demo credential for local use only, so the project runs with no setup. A real deployment would inject secrets from a secrets manager and never commit them.
+## Running it
 
-## On container startup, entrypoint.sh runs create_tables.py, which creates the database tables and seeds an EXTERNAL account for each supported currency. The deposit and withdraw endpoints assume these accounts already exist and return a 500 if one is missing.
+**1. Start everything.**
+- `docker compose up --build`
+- Starts Postgres 16 and the API.
 
-# ENV is not exposure but for this assignment purpose was not added to gitignore
+**2. Open the API.**
+- API on port 8000. Interactive docs at `/docs`.
+
+**3. Startup setup.**
+- `entrypoint.sh` is meant to run `app/create_table.py`.
+- It creates the tables and one EXTERNAL account per supported currency (USD, SGD).
+- Deposit and withdraw assume those accounts exist. If one is missing they return 500.
+
+## Credentials
+
+**1. Demo password only.**
+- `POSTGRES_PASSWORD` comes from the committed `.env` (`mysecret`).
+- It is a demo credential for local use, so the project runs with no setup.
+
+**2. Why `.env` is committed.**
+- It holds no real secret. It is committed on purpose for this assignment.
+- A real deployment would inject secrets from a secrets manager and never commit them.
+
+## Known limitations and next steps
+
+**1. Language.** The brief prefers Java. This is Python (FastAPI, SQLAlchemy, Postgres).
+**2. Reversals and the integrity check.** Designed above, not built.
+**3. Idempotency.** A reused key returns 409. Better: return the original result, and reject only if the details differ.
+**4. Exchange rates.** No live feed, no staleness limit, no inverse or triangulated rates.
+**5. Pagination.** Page and offset. Keyset pagination is better for large histories.
+**6. Security.** No authentication or account ownership checks.
+**7. Operations.** No audit log, monitoring or scheduled reconciliation.
