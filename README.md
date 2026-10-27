@@ -257,6 +257,7 @@ Month-end reconciliation works today, but it gets slower as the ledger grows. A 
 - It creates the tables and the system accounts: one EXTERNAL and one FX_POSITION account per supported currency (USD, SGD), so four in total.
 - It is safe to re-run. An account that already exists is skipped, so an older database only gets the missing ones.
 - Deposit and withdraw assume those accounts exist. If one is missing they return 500.
+- `app/create_table.py` is the only place tables are created. The API itself does not create them. To run without Docker, run `python -m app.create_table` once before starting the API.
 
 ## Credentials
 

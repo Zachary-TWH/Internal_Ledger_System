@@ -1,4 +1,8 @@
 from .database import engine, Base, SessionLocal
+
+# This import looks unused, but it is required. Each model class (Account, Transaction,
+# LedgerEntry) registers its table on Base.metadata at the moment this file runs.
+# Without the import, Base knows about no tables and create_all() below creates nothing.
 from . import models
 
 SYSTEM_CURRENCIES = ["SGD", "USD"]
@@ -10,6 +14,12 @@ SYSTEM_CURRENCIES = ["SGD", "USD"]
 SYSTEM_ACCOUNT_NAMES = ["EXTERNAL", "FX_POSITION"]
 
 def main():
+    # Base is the shared parent class of every model in models.py. Base.metadata is the
+    # list of all tables those classes defined (accounts, transactions, ledger_entries).
+    # create_all() looks at the database, then creates each table in that list that does
+    # not exist yet. Existing tables are left alone, so it is safe to run on every start.
+    # It never alters or drops a table, so a changed column needs a migration, not this.
+    # This is the one place tables are created. main.py does not do it.
     Base.metadata.create_all(bind=engine)
 
     db = SessionLocal()
