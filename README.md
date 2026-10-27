@@ -269,30 +269,6 @@ Two checks, both against the transaction history. The check only reports. It nev
 - **Stage 2, Docker smoke test:** `docker compose up`, wait for `/docs`, create an account, deposit 100. The deposit fails if the system accounts were not seeded.
 - **Stage 3, deploy (simulated):** only on `main`, only after stages 1 and 2 pass. It prints what a real deploy would do. There is no real target.
 
-## How a real bank's month-end differs (not implemented)
-
-This check compares the ledger with itself. A bank's month-end close compares its books with independent outside records, and manages what it finds. None of this is built.
-
-**1. Matching against outside statements.**
-- The bank's real accounts at other banks, the central bank, card schemes and payment networks each send statements (formats such as MT940 or camt.053).
-- Each ledger entry is matched to a statement line, one to one or one to many. What does not match is a "break": a missing item, a different amount, or a timing difference.
-- In this design, EXTERNAL's balance is the figure that should match the real bank balance, which is the natural place to connect an outside statement.
-
-**2. Daily closing balances and cut-off.**
-- Balances are frozen at each day's cut-off, with business-day and value-date rules, and compared as of that date.
-- This check reads live balances, so it cannot be run for an earlier date (see snapshots below).
-
-**3. Closing the period.**
-- Once a month is signed off it is locked. Later fixes are posted as correcting entries in the next period, never as edits to the closed month. A second person approves (maker-checker).
-- Every run is saved for audit, for example in a `reconciliation_runs` table.
-
-**4. Managing breaks.**
-- Unmatched items sit in suspense or clearing accounts, are aged, investigated, and written off only with approval.
-
-**5. Other tie-outs.**
-- The total of customer balances must equal the control account in the bank's general ledger, which must equal the real money held.
-- Payments that were started but not yet settled are timing differences, not errors.
-- Foreign-currency balances, including FX_POSITION, are revalued at the month-end rate, and the gain or loss is booked.
 
 ## Monthly balance snapshots (not implemented)
 
@@ -318,22 +294,7 @@ The check reads live balances, so it only says whether the books balance **now**
 - Change a snapshot row by hand. Expect the sum for that month to fail.
 - Run the job twice for the same month. Expect no duplicate rows (unique constraint).
 
-## Running it
 
-**1. Start everything.**
-- `docker compose up --build`
-- Starts Postgres 16 and the API.
-
-**2. Open the API.**
-- API on port 8000. Interactive docs at `/docs`.
-
-**3. Startup setup.**
-- On container start, `entrypoint.sh` runs `app/create_table.py` before the API starts.
-- It creates the tables and the system accounts: one EXTERNAL and one FX_POSITION account per supported currency (USD, SGD), so four in total.
-- It is safe to re-run. An account that already exists is skipped, so an older database only gets the missing ones.
-- Deposit and withdraw assume the EXTERNAL accounts exist, and a cross-currency transfer assumes the FX_POSITION accounts exist. If one is missing the request returns 500 and records nothing.
-- `create_all` never alters an existing table. Transactions now have required `type` and `reversal_of` columns, so a database created before reversals needs recreating: `docker compose down -v`, then `docker compose up --build`.
-- `app/create_table.py` is the only place tables are created. The API itself does not create them. To run without Docker, run `python -m app.create_table` once before starting the API.
 
 ## Credentials
 
@@ -345,14 +306,3 @@ The check reads live balances, so it only says whether the books balance **now**
 - It holds no real secret. It is committed on purpose for this assignment.
 - A real deployment would inject secrets from a secrets manager and never commit them.
 
-## Known limitations and next steps
-
-**1. Language.** The brief prefers Java. This is Python (FastAPI, SQLAlchemy, Postgres).
-**2. Month-end check.** Per-account stored vs ledger balance, plus a per-currency sum. It does not check each transaction's own entries, cannot re-run a past month, and has no outside statement to compare with. See the month-end section and "How a real bank differs".
-**3. Monthly balance snapshots.** The check reads live balances, so a past month cannot be re-run. Saved month-end snapshots fix this. Designed above, not built.
-**4. Idempotency.** A reused key returns 409. Better: return the original result, and reject only if the details differ.
-**5. Exchange rates.** Live rate from a free daily-reference service (Frankfurter), fetched per cross-currency transfer. Cross-currency transfers depend on that third party and are refused when it is down. No quote step, no spread, no fallback provider, no rate-age limit, no inverse or triangulated rates. See assumption 7.
-**6. Pagination.** Page and offset. Keyset pagination is better for large histories.
-**7. Security.** No authentication or account ownership checks.
-**8. Operations.** No audit log, monitoring or scheduled reconciliation.
-**9. Shared system-account rows.** Every deposit and withdrawal in a currency locks that currency's EXTERNAL row, and every conversion locks both FX_POSITION rows, so those requests queue. See assumption 10.
