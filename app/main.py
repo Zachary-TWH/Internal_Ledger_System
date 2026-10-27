@@ -13,6 +13,11 @@ Model
 - System accounts' balances move with every entry, exactly like a customer's. So adding up
   `accounts.balance` per currency must give 0.00. That is the month-end reconciliation.
 - Amounts are Decimal (never float). Only USD and SGD are supported (2 decimal places).
+- Append-only: ledger entries and transactions are never edited or deleted. Every transaction
+  has a `type` (DEPOSIT, WITHDRAWAL, TRANSFER, REVERSAL). A mistake is undone by POST
+  /transactions/{id}/reverse, which posts a NEW REVERSAL transaction whose entries offset the
+  original's (same accounts and amounts, DEBIT and CREDIT swapped). `reversal_of` is UNIQUE, so
+  a transaction can only be reversed once, and a REVERSAL itself cannot be reversed.
 
 Safety rules used by every write endpoint
 -----------------------------------------
@@ -39,6 +44,7 @@ from . import models
 from decimal import Decimal, ROUND_HALF_UP
 from datetime import datetime, timezone
 from sqlalchemy import func, case, and_
+from sqlalchemy.exc import IntegrityError
 from typing import Literal
 from decimal import Decimal
 
@@ -188,6 +194,11 @@ class TransferRequest(BaseModel):
         return value
 
 
+class ReversalRequest(BaseModel):
+    """Body of POST /transactions/{transaction_id}/reverse. `idempotency_key` must be unique per request."""
+    idempotency_key: str
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -237,7 +248,11 @@ def deposit(req: DepositRequest, db: Session = Depends(get_db)):
     external = lock_system_account(db, "EXTERNAL", account.currency)
 
     # create the transaction record
-    txn = models.Transaction(idempotency_key=req.idempotency_key, description="Deposit")
+    txn = models.Transaction(
+        idempotency_key=req.idempotency_key,
+        type=models.TransactionType.DEPOSIT,
+        description="Deposit",
+    )
     db.add(txn)
     db.flush()  # gets txn.id without committing yet
 
@@ -300,7 +315,11 @@ def withdraw(req: WithdrawalRequest, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail="Insufficient funds")
 
     # create one transaction record grouping the two ledger entries together
-    txn = models.Transaction(idempotency_key=req.idempotency_key, description="Withdrawal")
+    txn = models.Transaction(
+        idempotency_key=req.idempotency_key,
+        type=models.TransactionType.WITHDRAWAL,
+        description="Withdrawal",
+    )
     db.add(txn)
     db.flush()  # get txn.id without committing yet
 
@@ -443,6 +462,7 @@ def transfer(req: TransferRequest, db: Session = Depends(get_db)):
     # create one transaction record grouping all of the ledger entries together
     txn = models.Transaction(
         idempotency_key=req.idempotency_key,
+        type=models.TransactionType.TRANSFER,
         description="Transfer",
         exchange_rate_used=exchange_rate_used
     )
@@ -488,6 +508,141 @@ def transfer(req: TransferRequest, db: Session = Depends(get_db)):
     }
 
 
+@app.post("/transactions/{transaction_id}/reverse")
+def reverse_transaction(transaction_id: int, req: ReversalRequest, db: Session = Depends(get_db)):
+    """Undo a transaction by posting a new REVERSAL transaction. Nothing is edited or deleted.
+
+    The reversal has one entry for every entry of the original, on the same account and for the
+    same amount, with DEBIT and CREDIT swapped. It uses the ORIGINAL amounts, so a cross-currency
+    transfer gives back exactly what moved, whatever the exchange rate is today. The original's
+    `exchange_rate_used` is copied onto the reversal for the record. The balances of every account
+    involved (customer, EXTERNAL and FX_POSITION) move with the new entries, so each currency
+    still adds up to zero.
+
+    Example: transaction 2 transferred 40 USD from account 5 to account 6 (54.00 SGD). Reversing it
+    creates transaction 3 (type REVERSAL, reversal_of 2) with the entries swapped.
+
+    Double reversal is blocked three ways: a REVERSAL cannot be reversed; the original's row is
+    locked and checked for an existing reversal; and transactions.reversal_of is UNIQUE, so the
+    database itself rejects a second reversal even if two requests race.
+
+    Returns: {"transaction_id", "reversal_of", "entries": [{"account_id", "entry_type", "amount"}]}
+    Errors:
+      409  idempotency_key was already used
+      404  transaction not found
+      400  the transaction is itself a reversal
+      409  the transaction was already reversed
+      400  a customer account no longer holds enough money to reverse (for example the
+           recipient already spent it). Reversing then needs a separate process (a dispute or
+           a compensating transfer), which this API does not provide.
+    """
+    # check if this exact request was already processed before
+    existing = db.query(models.Transaction).filter_by(idempotency_key=req.idempotency_key).first()
+    if existing:
+        raise HTTPException(status_code=409, detail="Duplicate request")
+
+    # Lock the original transaction's row so two reversals of it run one at a time. Nothing else
+    # locks a transaction row, so this cannot deadlock with the account locks taken below.
+    original = db.query(models.Transaction).filter_by(id=transaction_id).with_for_update().first()
+    if not original:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+
+    if original.type == models.TransactionType.REVERSAL:
+        raise HTTPException(status_code=400, detail="A reversal cannot be reversed")
+
+    already = db.query(models.Transaction.id).filter_by(reversal_of=original.id).first()
+    if already:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Transaction {original.id} was already reversed by transaction {already.id}",
+        )
+
+    original_entries = (
+        db.query(models.LedgerEntry)
+        .filter_by(transaction_id=original.id)
+        .order_by(models.LedgerEntry.id)
+        .all()
+    )
+    if not original_entries:
+        raise HTTPException(status_code=500, detail="Original transaction has no ledger entries")
+
+    # Lock every account involved, in the same order as the other endpoints
+    # (customer accounts by id first, then system accounts by id), so requests cannot deadlock.
+    account_ids = {entry.account_id for entry in original_entries}
+    accounts = (
+        db.query(models.Account)
+        .filter(models.Account.id.in_(account_ids))
+        .order_by(models.Account.is_system, models.Account.id)
+        .with_for_update()
+        .all()
+    )
+    account_by_id = {account.id: account for account in accounts}
+
+    # Work out each balance after the reversal BEFORE changing anything. A DEBIT lowers a balance
+    # and a CREDIT raises it, so undoing an original DEBIT raises it and undoing a CREDIT lowers it.
+    new_balance = {account.id: account.balance for account in accounts}
+    for entry in original_entries:
+        if entry.entry_type == models.EntryType.DEBIT:
+            new_balance[entry.account_id] += entry.amount
+        else:
+            new_balance[entry.account_id] -= entry.amount
+
+    # Customers may not go below zero. System accounts (EXTERNAL, FX_POSITION) may be negative.
+    for account_id, balance in new_balance.items():
+        if balance < 0 and not account_by_id[account_id].is_system:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Cannot reverse: account {account_id} no longer holds enough to give the money back",
+            )
+
+    # the new transaction, linked to the original
+    reversal = models.Transaction(
+        idempotency_key=req.idempotency_key,
+        type=models.TransactionType.REVERSAL,
+        reversal_of=original.id,
+        description=f"Reversal of transaction {original.id}",
+        exchange_rate_used=original.exchange_rate_used,
+    )
+    db.add(reversal)
+    db.flush()  # get reversal.id without committing yet
+
+    # one offsetting entry per original entry: same account, same amount, opposite direction
+    reversed_entries = []
+    for entry in original_entries:
+        opposite = (
+            models.EntryType.CREDIT if entry.entry_type == models.EntryType.DEBIT
+            else models.EntryType.DEBIT
+        )
+        reversed_entries.append(models.LedgerEntry(
+            transaction_id=reversal.id,
+            account_id=entry.account_id,
+            entry_type=opposite,
+            amount=entry.amount,
+        ))
+    db.add_all(reversed_entries)
+
+    for account_id, balance in new_balance.items():
+        account_by_id[account_id].balance = balance
+
+    # commit everything together atomically: all or nothing
+    try:
+        db.commit()
+    except IntegrityError:
+        # the unique constraints are the last line of defence against a race
+        # (same idempotency_key twice, or the same transaction reversed twice)
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Duplicate request or transaction already reversed")
+
+    return {
+        "transaction_id": reversal.id,
+        "reversal_of": original.id,
+        "entries": [
+            {"account_id": e.account_id, "entry_type": e.entry_type, "amount": e.amount}
+            for e in reversed_entries
+        ],
+    }
+
+
 @app.get("/accounts/{account_id}", response_model=AccountOut)
 def get_account(account_id: int, db: Session = Depends(get_db)):
     """Return one account and its current balance (always read from the database).
@@ -505,8 +660,10 @@ def get_transactions(account_id: int, db: Session = Depends(get_db), page: int =
 
     Query params: page (starts at 1), page_size (default 20),
                   order ("desc" = newest first, the default; "asc" = oldest first).
-    Returns: {"page", "page_size", "order", "results": [{"transaction_id", "entry_type",
-              "amount", "description", "created_at"}]}
+    Returns: {"page", "page_size", "order", "results": [{"transaction_id", "type",
+              "reversal_of", "entry_type", "amount", "description", "created_at"}]}
+    `type` is DEPOSIT, WITHDRAWAL, TRANSFER or REVERSAL. `reversal_of` is the id of the
+    transaction a REVERSAL undoes (null for every other type).
     Entries are ordered by the transaction's created_at, then by entry id,
     so the order is stable when two entries share the same timestamp and pages never overlap.
     Errors: 404 account not found, 422 order is not "asc" or "desc"
@@ -544,6 +701,8 @@ def get_transactions(account_id: int, db: Session = Depends(get_db), page: int =
     for entry in entries:
         result.append({
             "transaction_id": entry.transaction_id,
+            "type": entry.transaction.type,                # DEPOSIT, WITHDRAWAL, TRANSFER or REVERSAL
+            "reversal_of": entry.transaction.reversal_of,  # id of the undone transaction, else null
             "entry_type": entry.entry_type,   # DEBIT or CREDIT
             "amount": entry.amount,
             "description": entry.transaction.description,  # e.g. "Deposit", "Withdrawal", "Transfer"

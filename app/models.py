@@ -30,6 +30,15 @@ class EntryType(str, enum.Enum):
     CREDIT = "CREDIT"
 
 
+class TransactionType(str, enum.Enum):
+    """What kind of business event a transaction is. Code checks this, not the description."""
+
+    DEPOSIT = "DEPOSIT"
+    WITHDRAWAL = "WITHDRAWAL"
+    TRANSFER = "TRANSFER"
+    REVERSAL = "REVERSAL"
+
+
 class Account(Base):
     """A customer or internal financial account denominated in one currency.
 
@@ -58,16 +67,38 @@ class Transaction(Base):
     transaction-processing service and database constraint.
     `exchange_rate_used` records the live FX rate actually applied to a cross-currency
     transfer (null otherwise). It is the only place a rate is stored: there is no rates table.
+
+    The ledger is append-only: transactions and entries are never edited or deleted.
+    A mistake is corrected by posting a new REVERSAL transaction whose entries offset the
+    original's. `type` says what kind of event this is. `reversal_of` points at the
+    transaction a REVERSAL undoes. It is UNIQUE, so one transaction can be reversed at most
+    once (a second reversal violates the constraint), and the CHECK below ties it to the type:
+    only a REVERSAL has a `reversal_of`, and every REVERSAL has one.
     """
 
     __tablename__ = "transactions"
 
     id = Column(Integer, primary_key=True, index=True)
     idempotency_key = Column(String, unique=True, index=True)
+    type = Column(Enum(TransactionType), nullable=False)
+    reversal_of = Column(
+        Integer,
+        ForeignKey("transactions.id"),
+        nullable=True,
+        unique=True,
+    )
     description = Column(String)
     created_at = Column(DateTime, server_default=func.now())
     notes = Column(String, nullable=True)
     exchange_rate_used = Column(Numeric(precision=18, scale=6), nullable=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            "(type = 'REVERSAL' AND reversal_of IS NOT NULL) "
+            "OR (type <> 'REVERSAL' AND reversal_of IS NULL)",
+            name="ck_transaction_reversal_matches_type",
+        ),
+    )
 
     entries = relationship("LedgerEntry", back_populates="transaction")
 
