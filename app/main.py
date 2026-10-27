@@ -2,10 +2,16 @@
 
 Model
 -----
-- Double-entry: every money movement is one Transaction with two LedgerEntry rows
-  (a DEBIT and a CREDIT of the same amount, in each account's own currency).
-- Money enters/leaves the system through a special account named "EXTERNAL".
-  Deposit:  DEBIT EXTERNAL, CREDIT user.   Withdrawal: DEBIT user, CREDIT EXTERNAL.
+- Double-entry: every money movement is one Transaction with LedgerEntry rows that net to
+  zero within each currency (a DEBIT lowers an account's balance, a CREDIT raises it).
+- Two kinds of system account exist, one of each per currency (created at startup):
+    EXTERNAL     the outside world. Deposit:  DEBIT EXTERNAL, CREDIT user.
+                                    Withdrawal: DEBIT user, CREDIT EXTERNAL.
+    FX_POSITION  the bank's currency-exchange counter. A cross-currency transfer has 4 entries:
+                 DEBIT source, CREDIT FX_POSITION (source currency),
+                 DEBIT FX_POSITION (destination currency), CREDIT destination.
+- System accounts' balances move with every entry, exactly like a customer's. So adding up
+  `accounts.balance` per currency must give 0.00. That is the month-end reconciliation.
 - Amounts are Decimal (never float). Only USD and SGD are supported (2 decimal places).
 
 Safety rules used by every write endpoint
@@ -13,7 +19,10 @@ Safety rules used by every write endpoint
 - Idempotency: each request carries an `idempotency_key`. A key that was already used
   is rejected with 409, so a retried request cannot move money twice.
 - Row locks: accounts are loaded with SELECT ... FOR UPDATE so concurrent requests on
-  the same account run one at a time and no update is lost.
+  the same account run one at a time and no update is lost. Locks are always taken in the
+  same order (customer accounts by id, then system accounts by id), so requests cannot
+  deadlock. Every deposit or withdrawal in a currency also locks that currency's EXTERNAL
+  row, so those requests run one after another (a known trade-off, see the README).
 - Atomicity: ledger entries and balance changes are committed together (all or nothing).
 """
 
@@ -28,7 +37,7 @@ from pydantic import BaseModel, field_validator
 from .database import SessionLocal
 from . import models
 from decimal import Decimal, ROUND_HALF_UP
-from datetime import datetime
+from datetime import datetime, timezone
 from sqlalchemy import func, case, and_
 from typing import Literal
 from decimal import Decimal
@@ -94,6 +103,23 @@ def get_db():
         yield db
     finally:
         db.close()
+
+
+def lock_system_account(db: Session, owner_name: str, currency: str) -> models.Account:
+    """Load one system account (EXTERNAL or FX_POSITION) with a row lock, or fail with 500.
+
+    Only rows with is_system = true count, so a customer cannot create an account called
+    "EXTERNAL" through POST /accounts and have money routed to it.
+    """
+    account = (
+        db.query(models.Account)
+        .filter_by(owner_name=owner_name, currency=currency, is_system=True)
+        .with_for_update()
+        .first()
+    )
+    if not account:
+        raise HTTPException(status_code=500, detail=f"{owner_name} account not configured")
+    return account
 
 
 # ---------------------------------------------------------------------------
@@ -188,6 +214,8 @@ def deposit(req: DepositRequest, db: Session = Depends(get_db)):
     """Add money to an account (money comes in from EXTERNAL).
 
     Ledger entries: DEBIT EXTERNAL, CREDIT the user's account.
+    Balances: the user's goes up and EXTERNAL's goes down by the same amount (so the
+    currency still sums to zero).
 
     Returns: {"transaction_id", "new_balance"}
     Errors:
@@ -205,10 +233,8 @@ def deposit(req: DepositRequest, db: Session = Depends(get_db)):
     if not account:
         raise HTTPException(status_code=404, detail="Account not found")
 
-    # find the EXTERNAL account dynamically instead of hardcoding its id
-    external = db.query(models.Account).filter_by(owner_name="EXTERNAL", currency=account.currency).first()
-    if not external:
-        raise HTTPException(status_code=500, detail="EXTERNAL account not configured")
+    # lock this currency's EXTERNAL account too (after the user's row, always in this order)
+    external = lock_system_account(db, "EXTERNAL", account.currency)
 
     # create the transaction record
     txn = models.Transaction(idempotency_key=req.idempotency_key, description="Deposit")
@@ -230,8 +256,9 @@ def deposit(req: DepositRequest, db: Session = Depends(get_db)):
     )
     db.add_all([debit_entry, credit_entry])
 
-    # update balance
+    # update both balances: the user gains, EXTERNAL goes down by the same amount
     account.balance += req.amount
+    external.balance -= req.amount
 
     # commit everything together atomically: all or nothing
     db.commit()
@@ -244,6 +271,7 @@ def withdraw(req: WithdrawalRequest, db: Session = Depends(get_db)):
     """Take money out of an account (money goes out to EXTERNAL).
 
     Ledger entries: DEBIT the user's account, CREDIT EXTERNAL.
+    Balances: the user's goes down and EXTERNAL's goes up by the same amount.
 
     Returns: {"transaction_id", "new_balance"}
     Errors:
@@ -264,10 +292,8 @@ def withdraw(req: WithdrawalRequest, db: Session = Depends(get_db)):
     if not account:
         raise HTTPException(status_code=404, detail="Account not found")
    
-    # find the EXTERNAL account dynamically instead of hardcoding its id
-    external = db.query(models.Account).filter_by(owner_name="EXTERNAL", currency=account.currency).first()
-    if not external:
-        raise HTTPException(status_code=500, detail="EXTERNAL account not configured")
+    # lock this currency's EXTERNAL account too (after the user's row, always in this order)
+    external = lock_system_account(db, "EXTERNAL", account.currency)
 
     # does the account have enough money? (e.g. balance 100 >= amount 40)
     if account.balance < req.amount:
@@ -294,8 +320,9 @@ def withdraw(req: WithdrawalRequest, db: Session = Depends(get_db)):
     )
     db.add_all([debit_entry, credit_entry])
 
-    # update balance: 100 - 40 = 60
+    # update both balances: 100 - 40 = 60 for the user, and EXTERNAL goes up by 40
     account.balance -= req.amount
+    external.balance += req.amount
 
     # commit everything together atomically: all or nothing
     db.commit()
@@ -317,7 +344,12 @@ def transfer(req: TransferRequest, db: Session = Depends(get_db)):
     other transfers on these accounts. If the rate cannot be fetched the transfer is refused
     (fail closed); a stale or guessed rate is never used. Same-currency transfers never call the API.
 
-    Ledger entries: DEBIT source (amount), CREDIT destination (credited_amount).
+    Ledger entries, same currency (2):
+      DEBIT source, CREDIT destination.
+    Ledger entries, cross-currency (4), so that each currency still sums to zero:
+      DEBIT source (amount)                      CREDIT FX_POSITION, source currency (amount)
+      DEBIT FX_POSITION, destination currency    CREDIT destination (credited_amount)
+    The balances of all four accounts move with their entries.
 
     Returns: {"transaction_id", "exchange_rate_used" (null if same currency),
               "from_account_new_balance", "to_account_new_balance"}
@@ -387,7 +419,28 @@ def transfer(req: TransferRequest, db: Session = Depends(get_db)):
         # 2 decimal places every amount is stored at (so the entry and the balance agree)
         credited_amount = (req.amount * exchange_rate_used).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
-    # create one transaction record grouping both ledger entries together
+    # Cross-currency: also lock the two FX_POSITION accounts (after the customer rows).
+    # One query with ORDER BY id, so the locks are always taken in the same order.
+    fx_from = fx_to = None
+    if exchange_rate_used is not None:
+        fx_rows = (
+            db.query(models.Account)
+            .filter(
+                models.Account.owner_name == "FX_POSITION",
+                models.Account.is_system.is_(True),
+                models.Account.currency.in_([from_account.currency, to_account.currency]),
+            )
+            .order_by(models.Account.id)
+            .with_for_update()
+            .all()
+        )
+        fx_by_currency = {row.currency: row for row in fx_rows}
+        if len(fx_by_currency) != 2:
+            raise HTTPException(status_code=500, detail="FX_POSITION account not configured")
+        fx_from = fx_by_currency[from_account.currency]
+        fx_to = fx_by_currency[to_account.currency]
+
+    # create one transaction record grouping all of the ledger entries together
     txn = models.Transaction(
         idempotency_key=req.idempotency_key,
         description="Transfer",
@@ -396,23 +449,30 @@ def transfer(req: TransferRequest, db: Session = Depends(get_db)):
     db.add(txn)
     db.flush()  # get txn.id without committing yet
 
-    # debit the source, in its own currency
-    debit_entry = models.LedgerEntry(
-        transaction_id=txn.id,
-        account_id=from_account.id,
-        entry_type=models.EntryType.DEBIT,
-        amount=req.amount
-    )
-    # credit the destination, in its own currency (converted, if currencies differ)
-    credit_entry = models.LedgerEntry(
-        transaction_id=txn.id,
-        account_id=to_account.id,
-        entry_type=models.EntryType.CREDIT,
-        amount=credited_amount
-    )
-    db.add_all([debit_entry, credit_entry])
+    def entry(account, entry_type, amount):
+        return models.LedgerEntry(
+            transaction_id=txn.id, account_id=account.id, entry_type=entry_type, amount=amount
+        )
 
-    # update both balances, each in their own currency
+    if fx_from is None:
+        # same currency: debit the source, credit the destination
+        db.add_all([
+            entry(from_account, models.EntryType.DEBIT, req.amount),
+            entry(to_account, models.EntryType.CREDIT, credited_amount),
+        ])
+    else:
+        # cross-currency: the source currency goes into FX_POSITION and the destination
+        # currency comes out of it, so each currency's entries net to zero on their own
+        db.add_all([
+            entry(from_account, models.EntryType.DEBIT, req.amount),
+            entry(fx_from, models.EntryType.CREDIT, req.amount),
+            entry(fx_to, models.EntryType.DEBIT, credited_amount),
+            entry(to_account, models.EntryType.CREDIT, credited_amount),
+        ])
+        fx_from.balance += req.amount
+        fx_to.balance -= credited_amount
+
+    # update the customer balances, each in their own currency
     from_account.balance -= req.amount
     to_account.balance += credited_amount
 
@@ -565,38 +625,34 @@ def fx_convert(from_currency: str, to_currency: str, amount: Decimal = Decimal("
 # Month-end reconciliation
 # ---------------------------------------------------------------------------
 
-CENT = Decimal("0.01")
-
-
 def _money(value) -> Decimal:
     """Round a database sum to 2 decimal places (the scale every amount is stored at)."""
-    return Decimal(value or 0).quantize(CENT, rounding=ROUND_HALF_UP)
+    return Decimal(str(value or 0)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
 
 @app.get("/reconciliation/month-end")
-def month_end_reconciliation(month: str, only_discrepancies: bool = False, db: Session = Depends(get_db)):
-    """Reconcile every account against the ledger for one month. Read-only: never edits balances.
+def month_end_reconciliation(month: str, db: Session = Depends(get_db)):
+    """Month-end check: for each currency, all account balances must add up to exactly 0.00.
 
-    Query params:
-      month               "YYYY-MM", e.g. "2026-10"
-      only_discrepancies  if true, `accounts` lists only the accounts that do not reconcile
+    Query param: month, "YYYY-MM" (e.g. "2026-10"). It labels the report; the balances are
+    read live at the moment of the call, so run it at month-end close.
 
-    Two checks are run:
-      1. Account check. Ledger balance = credits - debits over ALL ledger entries. It must equal
-         the account's stored balance. Each account also gets opening_balance (ledger balance
-         before the month), the month's credits and debits, and closing_balance (ledger balance at
-         the end of the month), so the month's activity can be tied out to a bank-statement view.
-         Accounts with is_system=True (EXTERNAL) are listed with their ledger balance but are not
-         compared, because deposits and withdrawals never update the EXTERNAL stored balance.
-      2. Transaction check, for transactions created in the month. Each must have exactly one
-         DEBIT and one CREDIT entry. Same-currency transactions need debit == credit. Cross-currency
-         ones need credit == debit * exchange_rate_used (rounded to 2 dp, 0.01 tolerance).
+    Why the sum is zero: every transaction's entries net to zero within each currency, and
+    every account's balance (customer, EXTERNAL and FX_POSITION) moves with its entries.
+    Customers' money is matched by EXTERNAL (net deposits less withdrawals, shown negative)
+    and FX_POSITION (net currency bought or sold through conversions).
 
-    Amounts are returned as strings with 2 decimal places so no float rounding can hide a difference.
-    Returns 200 even when discrepancies exist; check the "status" field.
+    Read-only: it never edits a balance. One query reads every balance at the same moment,
+    so a transfer committing mid-report cannot cause a false result.
+
+    Returns: {"month", "month_has_ended", "status" (RECONCILED / OUT_OF_BALANCE),
+              "currencies": [{"currency", "customers_total", "external_total",
+                              "fx_position_total", "net", "status"}]}
+    Amounts are strings with 2 decimal places. A non-zero "net" means something was written
+    outside the normal path. It does not say which account or transaction is wrong.
+    Returns 200 even when out of balance; read "status".
     Errors: 400 month is not in YYYY-MM format
     """
-    # parse "2026-10" into the first moment of that month, and the first moment of the next month
     try:
         month_start = datetime.strptime(month, "%Y-%m")
     except ValueError:
@@ -607,130 +663,42 @@ def month_end_reconciliation(month: str, only_discrepancies: bool = False, db: S
         1,
     )
 
-    Entry = models.LedgerEntry
-    Txn = models.Transaction
+    Account = models.Account
 
-    def total(entry_type, *conditions):
-        """SUM of entry amounts of one type (CREDIT/DEBIT), optionally limited by extra conditions."""
-        return func.coalesce(
-            func.sum(case((and_(Entry.entry_type == entry_type, *conditions), Entry.amount), else_=0)),
-            0,
-        )
+    def total_of(*conditions):
+        """SUM of balances for the accounts matching the conditions (0 if none)."""
+        return func.coalesce(func.sum(case((and_(*conditions), Account.balance), else_=0)), 0)
 
-    before_month = Txn.created_at < month_start
-    in_month = and_(Txn.created_at >= month_start, Txn.created_at < next_month_start)
-
-    # ONE query reads the stored balances and the ledger sums together, so Postgres gives
-    # both the same snapshot and a transfer committing mid-report cannot cause a false mismatch.
     rows = (
         db.query(
-            models.Account,
-            total(models.EntryType.CREDIT).label("credits_all"),
-            total(models.EntryType.DEBIT).label("debits_all"),
-            total(models.EntryType.CREDIT, before_month).label("credits_before"),
-            total(models.EntryType.DEBIT, before_month).label("debits_before"),
-            total(models.EntryType.CREDIT, in_month).label("credits_month"),
-            total(models.EntryType.DEBIT, in_month).label("debits_month"),
+            Account.currency,
+            total_of(Account.is_system.is_(False)).label("customers"),
+            total_of(Account.is_system.is_(True), Account.owner_name == "EXTERNAL").label("external"),
+            total_of(Account.is_system.is_(True), Account.owner_name == "FX_POSITION").label("fx_position"),
+            func.coalesce(func.sum(Account.balance), 0).label("net"),
         )
-        .outerjoin(Entry, Entry.account_id == models.Account.id)
-        .outerjoin(Txn, Entry.transaction_id == Txn.id)
-        .group_by(models.Account.id)
-        .order_by(models.Account.id)
+        .group_by(Account.currency)
+        .order_by(Account.currency)
         .all()
     )
 
-    accounts_report = []
-    mismatched = 0
-    for account, credits_all, debits_all, credits_before, debits_before, credits_month, debits_month in rows:
-        stored = _money(account.balance)
-        ledger_balance = _money(credits_all) - _money(debits_all)
-        opening = _money(credits_before) - _money(debits_before)
-        month_credits = _money(credits_month)
-        month_debits = _money(debits_month)
-        closing = opening + month_credits - month_debits
-        difference = stored - ledger_balance
-
-        if account.is_system:
-            status = "NOT_COMPARED"       # EXTERNAL's stored balance is not maintained
-        elif difference != 0:
-            status = "MISMATCH"
-            mismatched += 1
-        else:
-            status = "OK"
-
-        if only_discrepancies and status != "MISMATCH":
-            continue
-        accounts_report.append({
-            "account_id": account.id,
-            "owner_name": account.owner_name,
-            "currency": account.currency,
-            "is_system": account.is_system,
-            "opening_balance": str(opening),
-            "total_credits": str(month_credits),
-            "total_debits": str(month_debits),
-            "closing_balance": str(closing),
-            "stored_balance": str(stored),
-            "ledger_balance": str(ledger_balance),
-            "difference": str(difference),     # stored minus ledger; 0.00 when reconciled
-            "status": status,
+    currencies = []
+    for currency, customers, external, fx_position, net in rows:
+        net = _money(net)
+        currencies.append({
+            "currency": currency,
+            "customers_total": str(_money(customers)),
+            "external_total": str(_money(external)),
+            "fx_position_total": str(_money(fx_position)),
+            "net": str(net),
+            "status": "OK" if net == 0 else "OUT_OF_BALANCE",
         })
 
-    # Transaction check: one row per transaction created in the month. Outer join, so a
-    # transaction with no entries at all is still returned (and flagged).
-    txn_rows = (
-        db.query(
-            Txn.id,
-            Txn.exchange_rate_used,
-            total(models.EntryType.DEBIT).label("debit_total"),
-            total(models.EntryType.CREDIT).label("credit_total"),
-            func.coalesce(func.sum(case((Entry.entry_type == models.EntryType.DEBIT, 1), else_=0)), 0).label("n_debit"),
-            func.coalesce(func.sum(case((Entry.entry_type == models.EntryType.CREDIT, 1), else_=0)), 0).label("n_credit"),
-        )
-        .outerjoin(Entry, Entry.transaction_id == Txn.id)
-        .filter(in_month)
-        .group_by(Txn.id, Txn.exchange_rate_used)
-        .order_by(Txn.id)
-        .all()
-    )
-
-    transaction_discrepancies = []
-    for txn_id, rate, debit_total, credit_total, n_debit, n_credit in txn_rows:
-        debit_total = _money(debit_total)
-        credit_total = _money(credit_total)
-
-        issue = None
-        if n_debit != 1 or n_credit != 1:
-            issue = f"expected exactly 1 debit and 1 credit entry, found {n_debit} debit and {n_credit} credit"
-        elif rate is None:
-            if debit_total != credit_total:
-                issue = "debit and credit amounts differ on a same-currency transaction"
-        else:
-            expected_credit = (debit_total * rate).quantize(CENT, rounding=ROUND_HALF_UP)
-            if abs(credit_total - expected_credit) > CENT:
-                issue = f"credit does not equal debit x exchange rate (expected {expected_credit})"
-
-        if issue:
-            transaction_discrepancies.append({
-                "transaction_id": txn_id,
-                "issue": issue,
-                "debit_total": str(debit_total),
-                "credit_total": str(credit_total),
-                "exchange_rate_used": str(rate) if rate is not None else None,
-            })
-
-    reconciled = mismatched == 0 and not transaction_discrepancies
+    balanced = all(c["status"] == "OK" for c in currencies)
     return {
         "month": month,
-        "period_start": month_start.isoformat(),
-        "period_end_exclusive": next_month_start.isoformat(),
-        "month_has_ended": datetime.now() >= next_month_start,   # false = reconciling a month still in progress
-        "status": "RECONCILED" if reconciled else "DISCREPANCIES_FOUND",
-        "summary": {
-            "accounts_checked": sum(1 for account, *_ in rows if not account.is_system),
-            "accounts_mismatched": mismatched,
-            "transactions_checked": len(txn_rows),
-            "transactions_with_issues": len(transaction_discrepancies),
-        },
-        "accounts": accounts_report,
-        "transaction_discrepancies": transaction_discrepancies,
+        # false = the month is still in progress (timestamps are UTC, stored without a timezone)
+        "month_has_ended": datetime.now(timezone.utc).replace(tzinfo=None) >= next_month_start,
+        "status": "RECONCILED" if balanced else "OUT_OF_BALANCE",
+        "currencies": currencies,
     }

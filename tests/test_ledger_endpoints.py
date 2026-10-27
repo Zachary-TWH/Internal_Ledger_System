@@ -1,7 +1,7 @@
 """Endpoint tests for the ledger API.
 
 Covers POST /deposit, POST /withdraw, POST /transfer, GET /accounts/{id},
-GET /accounts/{id}/transactions and GET /reconciliation/month-end.
+GET /accounts/{id}/transactions, GET /fx/convert and GET /reconciliation/month-end.
 Concurrency and rounding are tested in test_postgres_concurrency.py, because SQLite
 ignores SELECT ... FOR UPDATE and does not round to the column's 2 decimal places.
 
@@ -12,7 +12,7 @@ Run from the repo root:  pytest tests/
 
 import os
 import tempfile
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from decimal import Decimal
 
 _db_file = os.path.join(tempfile.mkdtemp(), "test_ledger.db")
@@ -50,13 +50,14 @@ THIS_MONTH = datetime.now(timezone.utc).strftime("%Y-%m")
 
 @pytest.fixture(autouse=True)
 def fresh_db(monkeypatch):
-    """Empty tables, the two EXTERNAL system accounts (as create_table.py seeds them),
-    and a fake live FX rate (USD -> SGD 1.35, SGD -> USD 0.74)."""
+    """Empty tables, the four system accounts (EXTERNAL and FX_POSITION for USD and SGD, as
+    create_table.py seeds them), and a fake live FX rate (USD -> SGD 1.35, SGD -> USD 0.74)."""
     Base.metadata.drop_all(bind=engine)
     Base.metadata.create_all(bind=engine)
     db = SessionLocal()
-    for ccy in ("USD", "SGD"):
-        db.add(models.Account(owner_name="EXTERNAL", currency=ccy, balance=0, is_system=True))
+    for name in ("EXTERNAL", "FX_POSITION"):
+        for ccy in ("USD", "SGD"):
+            db.add(models.Account(owner_name=name, currency=ccy, balance=0, is_system=True))
     db.commit()
     db.close()
     FAKE_RATES.clear()
@@ -83,8 +84,17 @@ def report(month=THIS_MONTH, **params):
     return client.get("/reconciliation/month-end", params={"month": month, **params})
 
 
-def account_row(body, account_id):
-    return next(a for a in body["accounts"] if a["account_id"] == account_id)
+def currency_row(body, currency):
+    return next(c for c in body["currencies"] if c["currency"] == currency)
+
+
+def system_balance(owner_name, currency):
+    """Stored balance of a system account (EXTERNAL or FX_POSITION), read straight from the database."""
+    db = SessionLocal()
+    try:
+        return db.query(models.Account).filter_by(owner_name=owner_name, currency=currency, is_system=True).one().balance
+    finally:
+        db.close()
 
 
 # Raw helpers: return the response so a test can check error codes.
@@ -114,79 +124,79 @@ def count_rows(model):
         db.close()
 
 
-def test_clean_ledger_is_reconciled():
+# ---------------------------------------------------------------------------
+# GET /reconciliation/month-end
+# ---------------------------------------------------------------------------
+
+def test_clean_ledger_is_reconciled_and_each_currency_sums_to_zero():
+    alice, bob_sgd = new_account("alice"), new_account("bob", "SGD")
+    deposit(alice, 100, "d1")                                  # alice +100, EXTERNAL_USD -100
+    assert post_withdraw(alice, 40, "w1").status_code == 200   # alice -40,  EXTERNAL_USD +40
+    transfer(alice, bob_sgd, 50, "t1")                         # 50 USD -> 67.50 SGD at 1.35
+
+    body = report().json()
+
+    assert body["status"] == "RECONCILED"
+    assert currency_row(body, "USD") == {
+        "currency": "USD", "customers_total": "10.00", "external_total": "-60.00",
+        "fx_position_total": "50.00", "net": "0.00", "status": "OK",
+    }
+    assert currency_row(body, "SGD") == {
+        "currency": "SGD", "customers_total": "67.50", "external_total": "0.00",
+        "fx_position_total": "-67.50", "net": "0.00", "status": "OK",
+    }
+
+
+def test_empty_ledger_is_reconciled():
+    body = report().json()
+
+    assert body["status"] == "RECONCILED"
+    assert all(c["net"] == "0.00" for c in body["currencies"])
+
+
+def test_many_movements_in_both_directions_still_sum_to_zero():
+    alice, bob_sgd, carol = new_account("alice"), new_account("bob", "SGD"), new_account("carol")
+    deposit(alice, 500, "d1")
+    deposit(bob_sgd, 300, "d2")
+    transfer(alice, bob_sgd, 10.01, "t1")      # 10.01 x 1.35 = 13.5135 -> 13.51 SGD (rounds down)
+    transfer(bob_sgd, alice, 10, "t2")         # 10 SGD x 0.74 = 7.40 USD
+    transfer(alice, carol, 25, "t3")           # same currency: two entries, no FX accounts
+    assert post_withdraw(bob_sgd, 5, "w1").status_code == 200
+
+    body = report().json()
+
+    assert body["status"] == "RECONCILED"
+    assert currency_row(body, "USD")["net"] == "0.00" and currency_row(body, "SGD")["net"] == "0.00"
+
+
+def test_balance_changed_outside_the_normal_path_is_out_of_balance():
     alice, bob_sgd = new_account("alice"), new_account("bob", "SGD")
     deposit(alice, 100, "d1")
-    transfer(alice, bob_sgd, 40, "t1")   # cross-currency: 40 USD -> 54.00 SGD
-
-    body = report().json()
-    assert body["status"] == "RECONCILED"
-    assert body["summary"]["accounts_mismatched"] == 0
-    assert body["summary"]["transactions_checked"] == 2
-    assert body["transaction_discrepancies"] == []
-
-    a = account_row(body, alice)
-    assert (a["opening_balance"], a["total_credits"], a["total_debits"], a["closing_balance"]) == ("0.00", "100.00", "40.00", "60.00")
-    assert a["stored_balance"] == a["ledger_balance"] == "60.00" and a["status"] == "OK"
-    assert account_row(body, bob_sgd)["stored_balance"] == "54.00"
-
-    # EXTERNAL accounts are listed but not compared (their stored balance is never updated)
-    external = next(x for x in body["accounts"] if x["is_system"] and x["currency"] == "USD")
-    assert external["status"] == "NOT_COMPARED" and external["ledger_balance"] == "-100.00"
-
-
-def test_stored_balance_tampered_is_flagged():
-    alice = new_account("alice")
-    deposit(alice, 100, "d1")
+    deposit(bob_sgd, 100, "d2")
     db = SessionLocal()
-    db.query(models.Account).filter_by(id=alice).one().balance = Decimal("150.00")   # simulate corruption
+    db.query(models.Account).filter_by(id=alice).one().balance = Decimal("150.00")   # simulate corruption: +50
     db.commit()
     db.close()
 
     body = report().json()
-    assert body["status"] == "DISCREPANCIES_FOUND"
-    row = account_row(body, alice)
-    assert row["status"] == "MISMATCH" and row["difference"] == "50.00"
-    assert body["summary"]["accounts_mismatched"] == 1
 
-    only = report(only_discrepancies=True).json()
-    assert [a["account_id"] for a in only["accounts"]] == [alice]
+    assert body["status"] == "OUT_OF_BALANCE"
+    assert currency_row(body, "USD")["net"] == "50.00" and currency_row(body, "USD")["status"] == "OUT_OF_BALANCE"
+    assert currency_row(body, "SGD")["status"] == "OK"        # the other currency is unaffected
 
 
-def test_unbalanced_transaction_is_flagged():
+def test_offsetting_errors_are_not_detected():
+    """Known limit (documented in the README): +10 on one account and -10 on another cancel out."""
     alice, bob = new_account("alice"), new_account("bob")
     deposit(alice, 100, "d1")
-    transfer(alice, bob, 30, "t1")
+    deposit(bob, 100, "d2")
     db = SessionLocal()
-    credit = db.query(models.LedgerEntry).filter_by(account_id=bob).one()
-    credit.amount = Decimal("31.00")     # credit no longer matches the 30.00 debit
+    db.query(models.Account).filter_by(id=alice).one().balance = Decimal("110.00")
+    db.query(models.Account).filter_by(id=bob).one().balance = Decimal("90.00")
     db.commit()
     db.close()
 
-    body = report().json()
-    assert body["status"] == "DISCREPANCIES_FOUND"
-    assert len(body["transaction_discrepancies"]) == 1
-    assert body["transaction_discrepancies"][0]["debit_total"] == "30.00"
-    assert body["transaction_discrepancies"][0]["credit_total"] == "31.00"
-
-
-def test_opening_balance_uses_earlier_months():
-    alice = new_account("alice")
-    deposit(alice, 100, "d1")
-    deposit(alice, 25, "d2")
-    db = SessionLocal()
-    # move the first deposit to September 2020
-    first = db.query(models.Transaction).filter_by(idempotency_key="d1").one()
-    first.created_at = datetime(2020, 9, 15, 12, 0)
-    db.commit()
-    db.close()
-
-    sept = account_row(report("2020-09").json(), alice)
-    assert (sept["opening_balance"], sept["total_credits"], sept["closing_balance"]) == ("0.00", "100.00", "100.00")
-
-    this_month = account_row(report().json(), alice)
-    assert (this_month["opening_balance"], this_month["total_credits"], this_month["closing_balance"]) == ("100.00", "25.00", "125.00")
-    assert this_month["status"] == "OK"     # stored balance (125) matches the whole ledger
+    assert report().json()["status"] == "RECONCILED"
 
 
 def test_invalid_month_returns_400():
@@ -194,9 +204,83 @@ def test_invalid_month_returns_400():
         assert report(bad).status_code == 400
 
 
-def test_december_rolls_into_next_year():
-    body = report("2026-12").json()
-    assert body["period_end_exclusive"].startswith("2027-01-01")
+def test_month_has_ended_flag():
+    assert report("2020-01").json()["month_has_ended"] is True
+    assert report("2099-12").json()["month_has_ended"] is False      # December rolls into the next year
+
+
+# ---------------------------------------------------------------------------
+# System accounts: EXTERNAL and FX_POSITION balances move with every entry
+# ---------------------------------------------------------------------------
+
+def test_deposit_lowers_external_and_withdraw_raises_it():
+    alice = new_account("alice")
+
+    deposit(alice, 100, "d1")
+    assert system_balance("EXTERNAL", "USD") == Decimal("-100.00")
+
+    assert post_withdraw(alice, 40, "w1").status_code == 200
+    assert system_balance("EXTERNAL", "USD") == Decimal("-60.00")     # net money that came in
+    assert system_balance("EXTERNAL", "SGD") == 0                      # other currency untouched
+
+
+def test_cross_currency_transfer_writes_four_entries_through_fx_position():
+    alice, bob_sgd = new_account("alice"), new_account("bob", "SGD")
+    deposit(alice, 100, "d1")
+
+    body = post_transfer(alice, bob_sgd, 50, "t1").json()              # 50 USD x 1.35 = 67.50 SGD
+
+    db = SessionLocal()
+    entries = db.query(models.LedgerEntry).filter_by(transaction_id=body["transaction_id"]).order_by(models.LedgerEntry.id).all()
+    names = {a.id: (a.owner_name, a.currency) for a in db.query(models.Account).all()}
+    db.close()
+    rows = [(names[e.account_id], e.entry_type.value, e.amount) for e in entries]
+    assert rows == [
+        ((("alice", "USD")), "DEBIT", Decimal("50.00")),
+        (("FX_POSITION", "USD"), "CREDIT", Decimal("50.00")),
+        (("FX_POSITION", "SGD"), "DEBIT", Decimal("67.50")),
+        (("bob", "SGD"), "CREDIT", Decimal("67.50")),
+    ]
+    assert system_balance("FX_POSITION", "USD") == Decimal("50.00")    # bank took in 50 USD
+    assert system_balance("FX_POSITION", "SGD") == Decimal("-67.50")   # and paid out 67.50 SGD
+    assert system_balance("EXTERNAL", "USD") == Decimal("-100.00")     # unchanged by the conversion
+
+
+def test_same_currency_transfer_does_not_touch_system_accounts():
+    alice, bob = new_account("alice"), new_account("bob")
+    deposit(alice, 100, "d1")
+
+    transfer(alice, bob, 30, "t1")
+
+    assert system_balance("EXTERNAL", "USD") == Decimal("-100.00")
+    assert system_balance("FX_POSITION", "USD") == 0 and system_balance("FX_POSITION", "SGD") == 0
+
+
+def test_cross_currency_transfer_without_fx_position_accounts_returns_500_and_records_nothing():
+    alice, bob_sgd = new_account("alice"), new_account("bob", "SGD")
+    deposit(alice, 100, "d1")
+    db = SessionLocal()
+    db.query(models.Account).filter_by(owner_name="FX_POSITION").delete()
+    db.commit()
+    db.close()
+
+    r = post_transfer(alice, bob_sgd, 40, "t1")
+
+    assert r.status_code == 500
+    assert balance_of(alice) == 100 and balance_of(bob_sgd) == 0
+    assert count_rows(models.Transaction) == 1                         # only the deposit
+
+
+def test_deposit_needs_a_real_system_account_not_a_customer_called_external():
+    db = SessionLocal()
+    db.query(models.Account).filter_by(owner_name="EXTERNAL", currency="USD").delete()
+    db.commit()
+    db.close()
+    fake_external = new_account("EXTERNAL")           # a customer picks the same name through the API
+    alice = new_account("alice")
+
+    assert post_deposit(alice, 100, "d1").status_code == 500           # the lookup ignores non-system accounts
+    assert balance_of(alice) == 0 and balance_of(fake_external) == 0
 
 
 # ---------------------------------------------------------------------------
