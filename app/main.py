@@ -379,7 +379,7 @@ def get_transactions(account_id: int, db: Session = Depends(get_db), page: int =
                   order ("desc" = newest first, the default; "asc" = oldest first).
     Returns: {"page", "page_size", "order", "results": [{"transaction_id", "entry_type",
               "amount", "description", "created_at"}]}
-    Entries are ordered by the transaction's created_at (stored as UTC), then by entry id,
+    Entries are ordered by the transaction's created_at, then by entry id,
     so the order is stable when two entries share the same timestamp and pages never overlap.
     Errors: 404 account not found, 422 order is not "asc" or "desc"
     """

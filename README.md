@@ -37,6 +37,7 @@ Each assumption below is a rule the ledger follows. Examples use made-up numbers
 **6. EXTERNAL accounts represent the outside world.**
 - One per currency, created at startup (`is_system = true`).
 - Users cannot create them through the API.
+- Adding an EXTERNAL account for another currency is currently not supported. They are only created at startup for USD and SGD, so a new currency has no EXTERNAL account and deposits and withdrawals in it fail.
 - Their stored balance is not maintained. Their ledger balance is the net money that entered or left the system.
 - Example: deposit 100 USD, then withdraw 40 USD. EXTERNAL USD ledger balance is -60.
 
@@ -72,9 +73,9 @@ Each assumption below is a rule the ledger follows. Examples use made-up numbers
 - Example: a client retries `transfer-001` after a timeout. The second call is rejected, so the money moves once.
 - Limit: the 409 does not return the original result, and it does not check whether the retry had the same details.
 
-**12. Timestamps are meant to be UTC.**
-- `created_at` is stored without a timezone, using the database server clock.
-- Run the database in UTC. Month boundaries in reconciliation follow this clock.
+**12. Timestamps use the database server clock.**
+- `created_at` is stored without a timezone.
+- Month boundaries in reconciliation follow this clock.
 
 **13. No authentication or ownership checks.**
 - Anyone who can reach the API can act on any account.
@@ -199,7 +200,7 @@ It compares each account's stored balance with its ledger entries (credits minus
 
 **5. Assumptions and limits.**
 - EXTERNAL accounts are listed as `NOT_COMPARED`. Deposits and withdrawals do not update their stored balance. Their ledger balance is the net money that entered or left the system.
-- `created_at` has no timezone, so month boundaries follow the database server clock. Run the database in UTC.
+- `created_at` has no timezone, so month boundaries follow the database server clock.
 - Amounts are returned as 2-decimal strings, not floats, so rounding cannot hide a difference.
 - A month that has not ended can be reconciled. The response sets `month_has_ended: false`.
 - Not implemented: saving each run in a `reconciliation_runs` table for an audit trail, and the scheduled job.
