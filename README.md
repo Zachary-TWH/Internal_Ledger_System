@@ -32,7 +32,7 @@ Each assumption below is a rule the ledger follows. Examples use made-up numbers
 
 **5. Ledger entries are the source of truth. The stored balance is a fast copy.**
 - `accounts.balance` is updated on every posting, for customer accounts and system accounts alike, so reads are cheap.
-- Month-end reconciliation checks that the balances in each currency add up to zero. It does not compare each account's balance with its own entries (see the month-end section for why, and what that misses).
+- Month-end reconciliation runs two checks: each account's stored balance must equal its own credits minus debits, and the balances in each currency must add up to zero (see the month-end section).
 - Entries are never edited or deleted. A mistake is fixed with a new transaction.
 
 **6. System accounts: EXTERNAL and FX_POSITION.**
@@ -204,7 +204,17 @@ Balance and history reads are a good fit for caching. This is **not implemented*
 
 ## Month-end reconciliation (implemented)
 
-For each currency, all account balances (customers and system accounts) must add up to exactly 0.00. The check only reports. It never edits balances, because a real error should be fixed with a new, auditable ledger transaction. It also answers the "does all the money add up" behaviour from the brief.
+Two checks, both against the transaction history. The check only reports. It never edits balances, because a real error should be fixed with a new, auditable ledger transaction. Check 1 answers "accounts are reconciled against transaction history". Check 2 answers "does all the money add up".
+
+**Check 1: each account against its own entries.**
+- Ledger balance = sum of the account's CREDIT entries minus the sum of its DEBIT entries.
+- It must equal the stored `accounts.balance`. `difference` is stored minus ledger, so 0.00 means reconciled.
+- Example: Alice has CREDIT 100 and DEBIT 40, so her ledger balance is 60. If her stored balance is 70, the difference is 10.00 and she is a `MISMATCH`.
+- It covers EXTERNAL and FX_POSITION too, because their balances move with every entry.
+- Each account also shows the month's `total_credits` and `total_debits`, with `opening_balance` and `closing_balance` taken from the ledger at the start and end of the month.
+- The comparison uses all entries, because the stored balance is live and has no month-end snapshot. For a past month, `closing_balance` will not equal the stored balance if later transactions exist. That is expected.
+
+**Check 2: each currency adds up to zero.** The rest of this section describes it.
 
 **1. The idea.**
 - Every transaction's entries net to zero within each currency, and every account's balance (including EXTERNAL and FX_POSITION) moves with its entries. So the balances in one currency always add up to 0.00.
@@ -216,18 +226,19 @@ For each currency, all account balances (customers and system accounts) must add
 
 **2. Endpoint.**
 - `GET /reconciliation/month-end?month=YYYY-MM`
-- It returns one row per currency (`customers_total`, `external_total`, `fx_position_total`, `net`, `status` of `OK` or `OUT_OF_BALANCE`), an overall `status` of `RECONCILED` or `OUT_OF_BALANCE`, and `month_has_ended`.
+- It returns one row per currency (`customers_total`, `external_total`, `fx_position_total`, `net`, `status` of `OK` or `OUT_OF_BALANCE`), one row per account (check 1), a `summary` (`accounts_checked`, `accounts_mismatched`), an overall `status` of `RECONCILED` or `OUT_OF_BALANCE`, and `month_has_ended`.
+- The overall status is `OUT_OF_BALANCE` if any currency does not net to zero or any account is a `MISMATCH`.
 - Returns HTTP 200 even when out of balance. Read the `status` field. An invalid month returns 400.
-- Example, the data above: USD `net` is `0.00`, SGD `net` is `0.00`, overall `RECONCILED`. If someone sets Alice's balance to 60.00 by hand, USD `net` is `50.00` and the status is `OUT_OF_BALANCE`.
+- Example, the data above: USD `net` is `0.00`, SGD `net` is `0.00`, every account is `OK`, overall `RECONCILED`. If someone sets Alice's balance to 60.00 by hand, USD `net` is `50.00`, Alice shows a `difference` of `50.00`, and the status is `OUT_OF_BALANCE`.
 - `month` labels the report. Balances are read live when the call is made, so it must be run at month-end close. In a real system a scheduled job would call the same function on the 1st of each month.
 
 **3. No false alarms from live traffic.**
-- All balances are read in one SQL statement, so Postgres gives them the same snapshot. A transfer committing mid-report cannot cause a false result.
+- Every balance and every ledger sum is read in one SQL statement, so Postgres gives them the same snapshot. Both checks are built from that one result. A transfer committing mid-report cannot cause a false result.
 
 **4. Known flaws of this check.**
-- **It says that the books are off, not where.** It does not name the account or transaction. A non-zero `net` means something was written outside the normal path, and finding it means reading the ledger.
-- **Offsetting errors cancel out.** If one account is 10 too high and another is 10 too low, the sum is still 0. A test documents this.
-- **It no longer compares each balance with its own entries, or checks each transaction.** An earlier version did both, and also checked the rate used. They were removed to keep the check simple. A balance that drifted from its entries is only caught if nothing else drifted the opposite way.
+- **The per-currency sum says that the books are off, not where.** Check 1 names the account (a `MISMATCH` row), but a non-zero `net` on its own does not.
+- **Offsetting errors are caught by check 1.** If one account is 10 too high and another is 10 too low, the per-currency sum is still 0, but both accounts show a non-zero `difference`. A test covers this.
+- **It does not check each transaction.** It does not verify that every transaction's own entries net to zero, or that the stored rate matches the amounts. A transaction posted with unbalanced entries would also move the balances, so check 1 would still pass. This is not built.
 - **It reconciles the current moment, not a past month.** A stored balance has no history. To re-run an old month you need a saved snapshot (see below).
 - **It compares the ledger with itself.** It cannot see money that never reached the ledger, or a difference from the real bank balance. That needs an outside statement (see "How a real bank differs").
 - **A wrong rate is invisible.** Both FX legs come from the same rate, so they still balance.
@@ -236,7 +247,7 @@ For each currency, all account balances (customers and system accounts) must add
 
 **5. Tests.**
 - **Endpoint tests:** `tests/test_ledger_endpoints.py`. Covers `/deposit`, `/withdraw`, `/transfer`, `GET /accounts/{id}`, the transaction history, `/fx/convert` and the reconciliation endpoint.
-- Reconciliation tests: a worked example that sums to zero in both currencies, an empty ledger, many mixed movements including rounding, a hand-changed balance flagged as `OUT_OF_BALANCE` in one currency only, offsetting errors passing (the known limit), invalid months, and `month_has_ended`.
+- Reconciliation tests: a worked example that sums to zero in both currencies, an empty ledger, many mixed movements including rounding, a hand-changed balance flagged as `OUT_OF_BALANCE` in one currency only, offsetting errors caught by the per-account check, the per-account stored vs ledger columns, invalid months, and `month_has_ended`.
 - System account tests: deposit and withdraw move EXTERNAL, a cross-currency transfer writes four entries and moves FX_POSITION, a same-currency transfer leaves the system accounts alone, missing system accounts return 500 and record nothing, and a customer who names an account "EXTERNAL" is never used as the system account.
 - Reversal tests: each endpoint records its transaction type, a same-currency transfer, a deposit, a withdrawal and a cross-currency transfer are reversed back exactly (the FX reversal uses the original 40.00 and 54.00 after the rate moves, with no FX lookup), the reversal's entries mirror the original with DEBIT and CREDIT swapped, nothing existing is edited or deleted, a second reversal gives 409, reversing a reversal gives 400, an unknown transaction gives 404, a reused idempotency key gives 409, a recipient who already spent the money gives 400, the history shows `type` and `reversal_of`, and the database itself rejects a second reversal and mismatched `type` / `reversal_of` values.
 - The FX service is faked in every test (the network is never called), including a failing service (503 and nothing recorded). The real fetch function is tested separately against canned responses: valid, malformed, timeout and HTTP error.
@@ -334,7 +345,7 @@ The check reads live balances, so it only says whether the books balance **now**
 ## Known limitations and next steps
 
 **1. Language.** The brief prefers Java. This is Python (FastAPI, SQLAlchemy, Postgres).
-**2. Month-end check.** A per-currency balance sum only. It cannot say which account is wrong, misses offsetting errors, and has no outside statement to compare with. See the month-end section and "How a real bank differs".
+**2. Month-end check.** Per-account stored vs ledger balance, plus a per-currency sum. It does not check each transaction's own entries, cannot re-run a past month, and has no outside statement to compare with. See the month-end section and "How a real bank differs".
 **3. Monthly balance snapshots.** The check reads live balances, so a past month cannot be re-run. Saved month-end snapshots fix this. Designed above, not built.
 **4. Idempotency.** A reused key returns 409. Better: return the original result, and reject only if the details differ.
 **5. Exchange rates.** Live rate from a free daily-reference service (Frankfurter), fetched per cross-currency transfer. Cross-currency transfers depend on that third party and are refused when it is down. No quote step, no spread, no fallback provider, no rate-age limit, no inverse or triangulated rates. See assumption 7.

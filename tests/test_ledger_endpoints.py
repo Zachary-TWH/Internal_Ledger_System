@@ -185,8 +185,9 @@ def test_balance_changed_outside_the_normal_path_is_out_of_balance():
     assert currency_row(body, "SGD")["status"] == "OK"        # the other currency is unaffected
 
 
-def test_offsetting_errors_are_not_detected():
-    """Known limit (documented in the README): +10 on one account and -10 on another cancel out."""
+def test_offsetting_errors_are_caught_by_the_per_account_check():
+    """+10 on one account and -10 on another cancel out in the per-currency sum, but each
+    account's stored balance no longer matches its own ledger entries, so both are flagged."""
     alice, bob = new_account("alice"), new_account("bob")
     deposit(alice, 100, "d1")
     deposit(bob, 100, "d2")
@@ -196,7 +197,28 @@ def test_offsetting_errors_are_not_detected():
     db.commit()
     db.close()
 
-    assert report().json()["status"] == "RECONCILED"
+    body = report().json()
+
+    assert currency_row(body, "USD")["net"] == "0.00"          # the sum alone is fooled
+    assert body["status"] == "OUT_OF_BALANCE"                  # the per-account check is not
+    assert body["summary"]["accounts_mismatched"] == 2
+    flagged = {a["account_id"]: a for a in body["accounts"] if a["status"] == "MISMATCH"}
+    assert flagged[alice]["difference"] == "10.00" and flagged[bob]["difference"] == "-10.00"
+
+
+def test_account_report_shows_stored_vs_ledger_balance():
+    alice = new_account("alice")
+    deposit(alice, 100, "d1")
+    assert post_withdraw(alice, 40, "w1").status_code == 200
+
+    body = report().json()
+    row = next(a for a in body["accounts"] if a["account_id"] == alice)
+
+    assert row["total_credits"] == "100.00" and row["total_debits"] == "40.00"
+    assert row["stored_balance"] == "60.00" and row["ledger_balance"] == "60.00"
+    assert row["opening_balance"] == "0.00" and row["closing_balance"] == "60.00"
+    assert row["difference"] == "0.00" and row["status"] == "OK"
+    assert body["summary"] == {"accounts_checked": 5, "accounts_mismatched": 0}   # 4 system + alice
 
 
 def test_invalid_month_returns_400():

@@ -791,24 +791,33 @@ def _money(value) -> Decimal:
 
 @app.get("/reconciliation/month-end")
 def month_end_reconciliation(month: str, db: Session = Depends(get_db)):
-    """Month-end check: for each currency, all account balances must add up to exactly 0.00.
+    """Month-end check against the transaction history. Two checks, both read-only.
 
-    Query param: month, "YYYY-MM" (e.g. "2026-10"). It labels the report; the balances are
-    read live at the moment of the call, so run it at month-end close.
+    Query param: month, "YYYY-MM" (e.g. "2026-10"). Balances are live, so run this at month-end
+    close. The month only shapes the opening / credits / debits / closing columns.
 
-    Why the sum is zero: every transaction's entries net to zero within each currency, and
-    every account's balance (customer, EXTERNAL and FX_POSITION) moves with its entries.
-    Customers' money is matched by EXTERNAL (net deposits less withdrawals, shown negative)
-    and FX_POSITION (net currency bought or sold through conversions).
+    Check 1, per account: the stored balance must equal the ledger balance, which is the sum of
+    the account's CREDIT entries minus the sum of its DEBIT entries (all entries, all time).
+    Example: Alice has CREDIT 100 and DEBIT 40, so her ledger balance is 60. If the stored
+    balance is 70, difference = 70 - 60 = 10 and she is a MISMATCH. This covers system accounts
+    too, because EXTERNAL and FX_POSITION balances move with every entry.
 
-    Read-only: it never edits a balance. One query reads every balance at the same moment,
-    so a transfer committing mid-report cannot cause a false result.
+    Check 2, per currency: all stored balances (customers, EXTERNAL, FX_POSITION) must add up to
+    exactly 0.00, because every transaction's entries net to zero within each currency.
+
+    Nothing is edited. One query reads every balance and every ledger sum at the same moment,
+    so a transfer committing mid-report cannot cause a false result. Both checks are built from
+    that one result.
 
     Returns: {"month", "month_has_ended", "status" (RECONCILED / OUT_OF_BALANCE),
+              "summary": {"accounts_checked", "accounts_mismatched"},
               "currencies": [{"currency", "customers_total", "external_total",
-                              "fx_position_total", "net", "status"}]}
-    Amounts are strings with 2 decimal places. A non-zero "net" means something was written
-    outside the normal path. It does not say which account or transaction is wrong.
+                              "fx_position_total", "net", "status"}],
+              "accounts": [{"account_id", "owner_name", "currency", "is_system",
+                            "opening_balance", "total_credits", "total_debits", "closing_balance",
+                            "stored_balance", "ledger_balance", "difference", "status"}]}
+    Amounts are strings with 2 decimal places. `difference` is stored minus ledger, so 0.00 means
+    reconciled. opening/closing are ledger balances at the start and end of the month.
     Returns 200 even when out of balance; read "status".
     Errors: 400 month is not in YYYY-MM format
     """
@@ -823,41 +832,106 @@ def month_end_reconciliation(month: str, db: Session = Depends(get_db)):
     )
 
     Account = models.Account
+    Entry = models.LedgerEntry
+    Txn = models.Transaction
 
-    def total_of(*conditions):
-        """SUM of balances for the accounts matching the conditions (0 if none)."""
-        return func.coalesce(func.sum(case((and_(*conditions), Account.balance), else_=0)), 0)
+    def total(entry_type, *conditions):
+        """SUM of entry amounts of one type (CREDIT or DEBIT), optionally limited by extra conditions."""
+        return func.coalesce(
+            func.sum(case((and_(Entry.entry_type == entry_type, *conditions), Entry.amount), else_=0)),
+            0,
+        )
 
+    before_month = Txn.created_at < month_start
+    in_month = and_(Txn.created_at >= month_start, Txn.created_at < next_month_start)
+
+    # ONE query reads each stored balance and that account's ledger sums together, so Postgres
+    # gives them all the same snapshot. Both checks below are built from this one result.
+    # Outer joins keep an account that has no entries yet (its ledger balance is 0.00).
     rows = (
         db.query(
-            Account.currency,
-            total_of(Account.is_system.is_(False)).label("customers"),
-            total_of(Account.is_system.is_(True), Account.owner_name == "EXTERNAL").label("external"),
-            total_of(Account.is_system.is_(True), Account.owner_name == "FX_POSITION").label("fx_position"),
-            func.coalesce(func.sum(Account.balance), 0).label("net"),
+            Account,
+            total(models.EntryType.CREDIT).label("credits_all"),
+            total(models.EntryType.DEBIT).label("debits_all"),
+            total(models.EntryType.CREDIT, before_month).label("credits_before"),
+            total(models.EntryType.DEBIT, before_month).label("debits_before"),
+            total(models.EntryType.CREDIT, in_month).label("credits_month"),
+            total(models.EntryType.DEBIT, in_month).label("debits_month"),
         )
-        .group_by(Account.currency)
-        .order_by(Account.currency)
+        .outerjoin(Entry, Entry.account_id == Account.id)
+        .outerjoin(Txn, Entry.transaction_id == Txn.id)
+        .group_by(Account.id)
+        .order_by(Account.id)
         .all()
     )
 
-    currencies = []
-    for currency, customers, external, fx_position, net in rows:
-        net = _money(net)
-        currencies.append({
-            "currency": currency,
-            "customers_total": str(_money(customers)),
-            "external_total": str(_money(external)),
-            "fx_position_total": str(_money(fx_position)),
-            "net": str(net),
-            "status": "OK" if net == 0 else "OUT_OF_BALANCE",
+    accounts_report = []
+    mismatched = 0
+    per_currency = {}   # currency -> running totals of STORED balances, for check 2
+    for account, credits_all, debits_all, credits_before, debits_before, credits_month, debits_month in rows:
+        stored = _money(account.balance)
+        ledger_balance = _money(credits_all) - _money(debits_all)
+        opening = _money(credits_before) - _money(debits_before)
+        month_credits = _money(credits_month)
+        month_debits = _money(debits_month)
+        difference = stored - ledger_balance      # 0.00 when the account reconciles
+
+        if difference != 0:
+            status = "MISMATCH"
+            mismatched += 1
+        else:
+            status = "OK"
+
+        accounts_report.append({
+            "account_id": account.id,
+            "owner_name": account.owner_name,
+            "currency": account.currency,
+            "is_system": account.is_system,
+            "opening_balance": str(opening),
+            "total_credits": str(month_credits),
+            "total_debits": str(month_debits),
+            "closing_balance": str(opening + month_credits - month_debits),
+            "stored_balance": str(stored),
+            "ledger_balance": str(ledger_balance),
+            "difference": str(difference),
+            "status": status,
         })
 
-    balanced = all(c["status"] == "OK" for c in currencies)
+        # Check 2 input: add each stored balance to its currency's totals
+        totals = per_currency.setdefault(
+            account.currency,
+            {"customers": Decimal("0"), "external": Decimal("0"), "fx_position": Decimal("0"), "net": Decimal("0")},
+        )
+        if not account.is_system:
+            totals["customers"] += stored
+        elif account.owner_name == "EXTERNAL":
+            totals["external"] += stored
+        elif account.owner_name == "FX_POSITION":
+            totals["fx_position"] += stored
+        totals["net"] += stored
+
+    currencies = []
+    for currency in sorted(per_currency):
+        totals = per_currency[currency]
+        currencies.append({
+            "currency": currency,
+            "customers_total": str(totals["customers"]),
+            "external_total": str(totals["external"]),
+            "fx_position_total": str(totals["fx_position"]),
+            "net": str(totals["net"]),
+            "status": "OK" if totals["net"] == 0 else "OUT_OF_BALANCE",
+        })
+
+    balanced = mismatched == 0 and all(c["status"] == "OK" for c in currencies)
     return {
         "month": month,
         # false = the month is still in progress (timestamps are UTC, stored without a timezone)
         "month_has_ended": datetime.now(timezone.utc).replace(tzinfo=None) >= next_month_start,
         "status": "RECONCILED" if balanced else "OUT_OF_BALANCE",
+        "summary": {
+            "accounts_checked": len(rows),
+            "accounts_mismatched": mismatched,
+        },
         "currencies": currencies,
+        "accounts": accounts_report,
     }
