@@ -47,7 +47,7 @@ Each assumption below is a rule the ledger follows. Examples use made-up numbers
 - Same currency: destination gets the same amount. The FX service is never called.
 - Different currency: the live rate (source to destination) is fetched from the Frankfurter API when the transfer runs, and the destination gets the amount times that rate, rounded to 2 decimals (half up).
 - Example: send 100 USD at 1.35. The destination receives 135.00 SGD.
-- There is **no exchange-rate table**. Only the rate that was actually executed is stored, on the transaction (`exchange_rate_used`, 6 decimals). The rate used is the rate saved, and later rate moves never alter history. It is also what a reversal should reuse, and what month-end reconciliation checks against.
+- There is **no exchange-rate table**. Only the rate that was actually executed is stored, on the transaction (`exchange_rate_used`, 6 decimals). The rate used is the rate saved, and later rate moves never alter history. It is also what month-end reconciliation checks against.
 - **Fail closed.** If the rate cannot be fetched (timeout after 5 seconds, error, malformed or non-positive rate), the cross-currency transfer is rejected with 503 and nothing is recorded. A stale or guessed rate is never used. Same-currency transfers, deposits and withdrawals keep working. Because nothing was recorded, the client can retry with the same idempotency key.
 - **The rate is fetched before any row lock is taken** (after the idempotency check). A slow or hanging FX service therefore never holds up other transfers on those accounts. The only thing read before locking is the account currencies, which never change after creation. Balances are only read after the lock.
 - Only the direct pair is used. No inverse rates, no triangulation.
@@ -93,9 +93,6 @@ Each assumption below is a rule the ledger follows. Examples use made-up numbers
 - Anyone who can reach the API can act on any account.
 - This is a deliberate simplification for the assignment.
 
-**14. Not supported: reversals.**
-- There is no reversal endpoint. A correction today is a new, opposite transaction made by hand.
-
 ## Caching (not implemented)
 
 Balance and history reads are a good fit for caching. This is **not implemented** to keep the ledger simple.
@@ -123,18 +120,6 @@ Balance and history reads are a good fit for caching. This is **not implemented*
 **5. Trade-off.**
 - A displayed balance can be a few seconds out of date.
 - At this scale Postgres handles the read load, so the extra moving part is not worth it yet.
-
-**3. Guards.**
-- Unknown transaction: 404.
-- Already reversed: 409 (from the unique constraint).
-- Reversing a reversal: 400.
-- Recipient already spent the money: 400, balance too low. A real system would use a dispute or compensating process.
-- Takes an `idempotency_key` like every other write.
-
-**4. How I would test it.**
-- Deposit 100 into A, transfer 40 to B, reverse the transfer. Expect A = 100.00 and B = 0.00.
-- Reverse the same transaction again. Expect 409.
-- Repeat with a cross-currency transfer and a changed rate. Expect exact original amounts back.
 
 ## Total-money integrity check (not implemented)
 
@@ -183,7 +168,8 @@ It compares each account's stored balance with its ledger entries (credits minus
 - Stored balance 70.00 gives difference 0.00, status `OK`.
 - If someone sets the stored balance to 75.00, the difference is 5.00 and the status is `MISMATCH`.
 - The stored balance is compared with the ledger over **all** entries, because `accounts.balance` is a live balance with no month-end snapshot.
-- So for a past month, stored will not equal that month's `closing_balance` if later transactions exist. That is expected.
+- So for a past month, stored will not equal that month's `closing_balance` if later transactions exist. That is expected. Monthly snapshots (see below) would remove this limit.
+- `opening_balance` is found by summing every ledger entry before the month starts, so each run re-reads the whole history. Monthly snapshots would also fix this.
 
 **3. Check 2: transactions created in the month.**
 - Each must have exactly one DEBIT and one CREDIT entry.
@@ -201,7 +187,7 @@ It compares each account's stored balance with its ledger entries (credits minus
 - `created_at` has no timezone, so month boundaries follow the database server clock.
 - Amounts are returned as 2-decimal strings, not floats, so rounding cannot hide a difference.
 - A month that has not ended can be reconciled. The response sets `month_has_ended: false`.
-- Not implemented: saving each run in a `reconciliation_runs` table for an audit trail, and the scheduled job.
+- Not implemented: saving each run in a `reconciliation_runs` table for an audit trail, the scheduled job, and monthly balance snapshots (see "Monthly balance snapshots" below).
 
 **6. Tests.**
 - **Endpoint tests:** `tests/test_ledger_endpoints.py`. Covers `/deposit`, `/withdraw`, `/transfer`, `GET /accounts/{id}`, the transaction history and the reconciliation endpoint and `/fx/convert`. The FX service is faked in every test (the network is never called), including a failing service (503 and nothing recorded). The real fetch function is tested separately against canned responses: valid, malformed, timeout and HTTP error.
@@ -218,6 +204,44 @@ It compares each account's stored balance with its ledger entries (credits minus
 - **Stage 1, tests:** the endpoint tests on SQLite, then the concurrency and rounding tests against a Postgres service container. Python 3.14.
 - **Stage 2, Docker smoke test:** `docker compose up`, wait for `/docs`, create an account, deposit 100. The deposit fails if the system accounts were not seeded.
 - **Stage 3, deploy (simulated):** only on `main`, only after stages 1 and 2 pass. It prints what a real deploy would do. There is no real target.
+
+## Monthly balance snapshots (not implemented)
+
+Month-end reconciliation works today, but it gets slower as the ledger grows. A snapshot saved at each month-end would give the next month an opening balance to start from, so old entries are not read again. This is **not implemented**.
+
+**1. The problem today.**
+- To get an account's `opening_balance`, the report sums every ledger entry before the month starts.
+- Example: reconciling 2027-10 reads every entry since the first day of the system, even though only October is being checked.
+- The work grows with total history, not with the month's activity. As the system gets larger, every run gets slower.
+
+**2. The design.**
+- A new table `account_snapshots` with: `account_id`, `month`, `closing_balance`, `last_entry_id`, `taken_at`. One row per account per month, unique on (`account_id`, `month`).
+- After a month has ended and reconciled cleanly, a scheduled job writes each account's `closing_balance` (opening + credits - debits for that month).
+- `last_entry_id` is the highest ledger entry included. It makes the cut-off exact, instead of relying on `created_at`, which follows the database server clock and has no timezone.
+- Snapshots are write-once. A snapshot is never edited. If one looks wrong, that is a reconciliation problem to investigate, not something to overwrite quietly.
+- In a real system the job runs on the 1st of each month, straight after reconciliation.
+
+**3. How reconciliation would change.**
+- The opening balance is the previous month's snapshot. Only the month being checked is read from the ledger.
+- Example: account 7 has a 2026-09 snapshot of 70.00. For 2026-10 the report reads only October's entries (credits 100.00, debits 30.00) and gets closing 140.00. Nothing before October is scanned.
+- The stored balance is checked against the latest snapshot plus the entries after its `last_entry_id`, not against the full history.
+- A past month's closing balance can be compared directly with its snapshot.
+- If no snapshot exists (the first month, or a missed run), reconciliation falls back to the full scan and says so in the response. The answer is still correct, just slower.
+
+**4. Checking the snapshots themselves.**
+- A snapshot is only as trustworthy as the check that produced it, so it is written only after a clean reconciliation.
+- A periodic full re-sum from the first entry (for example each quarter, at a quiet time) confirms the snapshots still match the ledger. A mismatch means data was changed after the fact.
+
+**5. Trade-offs.**
+- One more table, and a job that must run reliably. A missed month means a longer read, not a wrong answer.
+- A wrong snapshot is carried into later months until the full re-sum catches it.
+- The snapshot job must read one consistent view of balances and entries, as the report does now with a single SQL statement.
+
+**6. How I would test it.**
+- Post entries across two months, snapshot the first, reconcile the second. Expect the same opening and closing balances as the full scan.
+- Change a snapshot row by hand. Expect the full re-sum to flag it.
+- Reconcile a month with no snapshot. Expect the fallback and a note in the response.
+- Run the snapshot job twice for the same month. Expect no duplicate rows (unique constraint).
 
 ## Running it
 
@@ -247,9 +271,10 @@ It compares each account's stored balance with its ledger entries (credits minus
 ## Known limitations and next steps
 
 **1. Language.** The brief prefers Java. This is Python (FastAPI, SQLAlchemy, Postgres).
-**2. Reversals and the integrity check.** Designed above, not built.
-**3. Idempotency.** A reused key returns 409. Better: return the original result, and reject only if the details differ.
-**4. Exchange rates.** Live rate from a free daily-reference service (Frankfurter), fetched per cross-currency transfer. Cross-currency transfers depend on that third party and are refused when it is down. No quote step, no spread, no fallback provider, no rate-age limit, no inverse or triangulated rates. See assumption 7.
-**5. Pagination.** Page and offset. Keyset pagination is better for large histories.
-**6. Security.** No authentication or account ownership checks.
-**7. Operations.** No audit log, monitoring or scheduled reconciliation.
+**2. Integrity check.** Designed above, not built.
+**3. Monthly balance snapshots.** Reconciliation re-reads the whole history to get each opening balance, so it slows down as the ledger grows. A saved month-end snapshot per account fixes this. Designed above, not built.
+**4. Idempotency.** A reused key returns 409. Better: return the original result, and reject only if the details differ.
+**5. Exchange rates.** Live rate from a free daily-reference service (Frankfurter), fetched per cross-currency transfer. Cross-currency transfers depend on that third party and are refused when it is down. No quote step, no spread, no fallback provider, no rate-age limit, no inverse or triangulated rates. See assumption 7.
+**6. Pagination.** Page and offset. Keyset pagination is better for large histories.
+**7. Security.** No authentication or account ownership checks.
+**8. Operations.** No audit log, monitoring or scheduled reconciliation.
