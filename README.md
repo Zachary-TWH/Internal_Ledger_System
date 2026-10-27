@@ -198,14 +198,18 @@ It compares each account's stored balance with its ledger entries (credits minus
 - Not implemented: saving each run in a `reconciliation_runs` table for an audit trail, and the scheduled job.
 
 **6. Tests.**
-- File: `tests/test_ledger_endpoints.py`. It covers `/deposit`, `/withdraw`, `/transfer` and the reconciliation endpoint.
-- Concurrency (row locks) is not covered, because SQLite ignores `SELECT ... FOR UPDATE`.
+- **Endpoint tests:** `tests/test_ledger_endpoints.py`. Covers `/deposit`, `/withdraw`, `/transfer`, `GET /accounts/{id}`, the transaction history and the reconciliation endpoint.
+- **Concurrency and rounding tests:** `tests/test_postgres_concurrency.py`. They need real Postgres, because SQLite ignores `SELECT ... FOR UPDATE` and does not round to 2 decimals.
+- They cover 20 parallel deposits into one account, 20 parallel withdrawals that must never overdraw, opposite-direction transfers with no deadlock, 10 identical simultaneous requests, and rounding of a converted amount (0.10 USD at 1.35 becomes 0.14 SGD).
 - They use a temporary SQLite database, so no Postgres is needed.
-- Run: `pip install pytest httpx`, then `pytest tests/`.
+- Run the endpoint tests: `pip install pytest httpx`, then `pytest tests/test_ledger_endpoints.py`.
+- Run the Postgres tests on their own, against an empty test database (its tables are dropped and recreated):
+  `TEST_POSTGRES_URL=postgresql+psycopg://postgres:postgres@localhost:5432/ledger_test pytest tests/test_postgres_concurrency.py`
+- Without `TEST_POSTGRES_URL`, the Postgres file is skipped.
 
 **7. CI/CD pipeline.**
 - File: `.github/workflows/ci.yml`. Runs on every push to `main` and every pull request.
-- **Stage 1, tests:** `pytest tests/` on Python 3.14.
+- **Stage 1, tests:** the endpoint tests on SQLite, then the concurrency and rounding tests against a Postgres service container. Python 3.14.
 - **Stage 2, Docker smoke test:** `docker compose up`, wait for `/docs`, create an account, deposit 100. The deposit fails if the EXTERNAL accounts were not seeded.
 - **Stage 3, deploy (simulated):** only on `main`, only after stages 1 and 2 pass. It prints what a real deploy would do. There is no real target.
 

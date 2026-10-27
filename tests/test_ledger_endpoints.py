@@ -1,7 +1,9 @@
 """Endpoint tests for the ledger API.
 
-Covers POST /deposit, POST /withdraw, POST /transfer and GET /reconciliation/month-end.
-Concurrency (row locks) is not tested here, because SQLite ignores SELECT ... FOR UPDATE.
+Covers POST /deposit, POST /withdraw, POST /transfer, GET /accounts/{id},
+GET /accounts/{id}/transactions and GET /reconciliation/month-end.
+Concurrency and rounding are tested in test_postgres_concurrency.py, because SQLite
+ignores SELECT ... FOR UPDATE and does not round to the column's 2 decimal places.
 
 Runs against a throwaway SQLite file (no Postgres needed). DATABASE_URL must be set
 before app.main is imported, because app/database.py builds the engine at import time.
@@ -427,3 +429,85 @@ def test_rate_change_after_transfer_does_not_alter_past_transaction():
     old_txn = db.query(models.Transaction).filter_by(id=first["transaction_id"]).one()
     db.close()
     assert old_txn.exchange_rate_used == Decimal("1.350000")    # first transaction unchanged
+
+
+# ---------------------------------------------------------------------------
+# GET /accounts/{id}
+# ---------------------------------------------------------------------------
+
+def test_get_account_returns_balance_and_currency():
+    bob_sgd = new_account("bob", "SGD")
+
+    body = client.get(f"/accounts/{bob_sgd}").json()
+    assert body == {"id": bob_sgd, "owner_name": "bob", "currency": "SGD", "balance": 0}
+
+    deposit(bob_sgd, 100, "d1")
+    assert client.get(f"/accounts/{bob_sgd}").json()["balance"] == 100
+
+
+def test_get_account_unknown_returns_404():
+    assert client.get("/accounts/9999").status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# GET /accounts/{id}/transactions
+# ---------------------------------------------------------------------------
+
+def history(account_id, **params):
+    return client.get(f"/accounts/{account_id}/transactions", params=params)
+
+
+def txn_ids(response):
+    return [row["transaction_id"] for row in response.json()["results"]]
+
+
+def test_history_is_newest_first_by_default_and_oldest_first_with_asc():
+    alice = new_account("alice")
+    t1 = post_deposit(alice, 100, "d1").json()["transaction_id"]
+    t2 = post_deposit(alice, 25, "d2").json()["transaction_id"]
+    t3 = post_withdraw(alice, 10, "w1").json()["transaction_id"]
+
+    assert txn_ids(history(alice)) == [t3, t2, t1]
+    assert txn_ids(history(alice, order="asc")) == [t1, t2, t3]
+    assert history(alice).json()["order"] == "desc"
+
+
+def test_history_rows_show_type_amount_and_description():
+    alice, bob_sgd = new_account("alice"), new_account("bob", "SGD")
+    deposit(alice, 100, "d1")
+    transfer(alice, bob_sgd, 40, "t1")      # 40 USD -> 54.00 SGD
+
+    alice_rows = history(alice, order="asc").json()["results"]
+    assert [(r["entry_type"], r["amount"], r["description"]) for r in alice_rows] == [
+        ("CREDIT", 100, "Deposit"),
+        ("DEBIT", 40, "Transfer"),
+    ]
+    bob_rows = history(bob_sgd).json()["results"]
+    assert [(r["entry_type"], r["amount"], r["description"]) for r in bob_rows] == [("CREDIT", 54, "Transfer")]
+    assert all(r["created_at"] for r in alice_rows)
+
+
+def test_history_paging_has_no_gaps_or_overlaps():
+    alice = new_account("alice")
+    ids = [post_deposit(alice, 10, f"d{i}").json()["transaction_id"] for i in range(5)]
+
+    pages = [txn_ids(history(alice, order="asc", page=p, page_size=2)) for p in (1, 2, 3, 4)]
+
+    assert pages == [ids[0:2], ids[2:4], ids[4:5], []]
+
+
+def test_history_of_account_with_no_activity_is_empty():
+    alice = new_account("alice")
+
+    body = history(alice).json()
+    assert body["results"] == [] and body["page"] == 1
+
+
+def test_history_unknown_account_returns_404():
+    assert history(9999).status_code == 404
+
+
+def test_history_invalid_order_returns_422():
+    alice = new_account("alice")
+
+    assert history(alice, order="sideways").status_code == 422
