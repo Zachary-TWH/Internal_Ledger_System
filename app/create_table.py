@@ -1,7 +1,6 @@
 from .database import engine, Base, SessionLocal
 
-# This import looks unused, but it is required. Each model class (Account, Transaction,
-# LedgerEntry) registers its table on Base.metadata at the moment this file runs.
+# Each model class (Account, Transaction, LedgerEntry) registers its table on Base.metadata at the moment this file runs.
 # Without the import, Base knows about no tables and create_all() below creates nothing.
 from . import models
 
