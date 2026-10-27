@@ -23,7 +23,7 @@ Each assumption below is a rule the ledger follows. Examples use made-up numbers
 **3. Each account has one fixed currency.**
 - Set at creation, never changed.
 - `POST /accounts` only accepts a supported currency (USD or SGD, case-insensitive) and rejects anything else with 422, because other currencies have no system accounts and could never be funded.
-- `GET /accounts/{id}` returns `balance` as a string such as `"60.00"`, so no precision is lost.
+- Every amount in an API response is a 2-decimal string such as `"60.00"` (balances, ledger entry amounts, `new_balance`), and `exchange_rate_used` is a 6-decimal string such as `"1.350000"`. FastAPI would otherwise turn a Decimal into a float (`100.1`), so no precision is lost this way.
 - Example: account 3 is SGD, so every entry on it is in SGD.
 
 **4. Every movement is double-entry.**

@@ -315,7 +315,7 @@ def test_deposit_increases_balance_and_writes_two_entries():
     r = post_deposit(alice, 100, "d1")
 
     assert r.status_code == 200
-    assert r.json()["new_balance"] == 100
+    assert r.json()["new_balance"] == "100.00"
     assert balance_of(alice) == 100
     # one transaction with a DEBIT (EXTERNAL) and a CREDIT (alice) of the same amount
     db = SessionLocal()
@@ -360,7 +360,7 @@ def test_withdraw_decreases_balance_and_writes_two_entries():
     r = post_withdraw(alice, 40, "w1")
 
     assert r.status_code == 200
-    assert r.json()["new_balance"] == 60
+    assert r.json()["new_balance"] == "60.00"
     assert balance_of(alice) == 60
     # DEBIT alice, CREDIT EXTERNAL
     db = SessionLocal()
@@ -427,8 +427,8 @@ def test_transfer_same_currency_updates_both_balances_and_writes_two_entries():
     assert r.status_code == 200
     body = r.json()
     assert body["exchange_rate_used"] is None                # same currency: no conversion
-    assert body["from_account_new_balance"] == 70
-    assert body["to_account_new_balance"] == 30
+    assert body["from_account_new_balance"] == "70.00"
+    assert body["to_account_new_balance"] == "30.00"
     assert balance_of(alice) == 70 and balance_of(bob) == 30
     db = SessionLocal()
     entries = db.query(models.LedgerEntry).filter_by(transaction_id=body["transaction_id"]).all()
@@ -447,9 +447,9 @@ def test_transfer_cross_currency_converts_with_live_rate():
 
     assert r.status_code == 200
     body = r.json()
-    assert body["exchange_rate_used"] == 1.35
-    assert body["from_account_new_balance"] == 60
-    assert body["to_account_new_balance"] == 54
+    assert body["exchange_rate_used"] == "1.350000"
+    assert body["from_account_new_balance"] == "60.00"
+    assert body["to_account_new_balance"] == "54.00"
     db = SessionLocal()
     txn = db.query(models.Transaction).filter_by(id=body["transaction_id"]).one()
     db.close()
@@ -566,7 +566,7 @@ def test_rate_change_after_transfer_does_not_alter_past_transaction():
     FAKE_RATES[("USD", "SGD")] = Decimal("1.500000")
     second = post_transfer(alice, bob_sgd, 40, "t2").json()     # at 1.50 -> 60.00 SGD
 
-    assert second["exchange_rate_used"] == 1.5
+    assert second["exchange_rate_used"] == "1.500000"
     assert balance_of(bob_sgd) == 114                           # 54 + 60
     db = SessionLocal()
     old_txn = db.query(models.Transaction).filter_by(id=first["transaction_id"]).one()
@@ -635,11 +635,11 @@ def test_history_rows_show_type_amount_and_description():
 
     alice_rows = history(alice, order="asc").json()["results"]
     assert [(r["entry_type"], r["amount"], r["description"]) for r in alice_rows] == [
-        ("CREDIT", 100, "Deposit"),
-        ("DEBIT", 40, "Transfer"),
+        ("CREDIT", "100.00", "Deposit"),
+        ("DEBIT", "40.00", "Transfer"),
     ]
     bob_rows = history(bob_sgd).json()["results"]
-    assert [(r["entry_type"], r["amount"], r["description"]) for r in bob_rows] == [("CREDIT", 54, "Transfer")]
+    assert [(r["entry_type"], r["amount"], r["description"]) for r in bob_rows] == [("CREDIT", "54.00", "Transfer")]
     assert all(r["created_at"] for r in alice_rows)
 
 
@@ -998,3 +998,4 @@ def test_database_ties_reversal_of_to_the_reversal_type():
         _insert_txn(idempotency_key="k1", type=models.TransactionType.REVERSAL, reversal_of=None)
     with pytest.raises(Exception):               # only a REVERSAL may have reversal_of
         _insert_txn(idempotency_key="k2", type=models.TransactionType.TRANSFER, reversal_of=1)
+

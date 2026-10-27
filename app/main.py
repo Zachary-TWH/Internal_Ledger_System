@@ -111,6 +111,15 @@ def get_db():
         db.close()
 
 
+def money_str(value: Decimal) -> str:
+    """Format a stored amount as a 2-decimal string, e.g. "60.00".
+
+    Returned in JSON instead of a Decimal, because FastAPI turns a Decimal inside a plain dict
+    into a float (60.1), which would lose the exactness the ledger keeps in the database.
+    """
+    return str(Decimal(value).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+
 def flush_or_409(db: Session):
     """Send the pending INSERTs to the database, turning a duplicate idempotency_key into a 409."""
     try:
@@ -264,7 +273,7 @@ def deposit(req: DepositRequest, db: Session = Depends(get_db)):
     Balances: the user's goes up and EXTERNAL's goes down by the same amount (so the
     currency still sums to zero).
 
-    Returns: {"transaction_id", "new_balance"}
+    Returns: {"transaction_id", "new_balance"}. Amounts are strings with 2 decimals, e.g. "60.00".
     Errors:
       409  idempotency_key was already used
       404  account not found
@@ -314,7 +323,7 @@ def deposit(req: DepositRequest, db: Session = Depends(get_db)):
     # commit everything together atomically: all or nothing
     commit_or_409(db)
     db.refresh(account)
-    return {"transaction_id": txn.id, "new_balance": account.balance}
+    return {"transaction_id": txn.id, "new_balance": money_str(account.balance)}
 
 
 @app.post("/withdraw")
@@ -382,7 +391,7 @@ def withdraw(req: WithdrawalRequest, db: Session = Depends(get_db)):
     # commit everything together atomically: all or nothing
     commit_or_409(db)
     db.refresh(account)
-    return {"transaction_id": txn.id, "new_balance": account.balance}
+    return {"transaction_id": txn.id, "new_balance": money_str(account.balance)}
 
 
 @app.post("/transfer")
@@ -538,9 +547,9 @@ def transfer(req: TransferRequest, db: Session = Depends(get_db)):
     db.refresh(to_account)
     return {
         "transaction_id": txn.id,
-        "exchange_rate_used": exchange_rate_used,
-        "from_account_new_balance": from_account.balance,
-        "to_account_new_balance": to_account.balance
+        "exchange_rate_used": str(exchange_rate_used) if exchange_rate_used is not None else None,
+        "from_account_new_balance": money_str(from_account.balance),
+        "to_account_new_balance": money_str(to_account.balance)
     }
 
 
@@ -673,7 +682,7 @@ def reverse_transaction(transaction_id: int, req: ReversalRequest, db: Session =
         "transaction_id": reversal.id,
         "reversal_of": original.id,
         "entries": [
-            {"account_id": e.account_id, "entry_type": e.entry_type, "amount": e.amount}
+            {"account_id": e.account_id, "entry_type": e.entry_type, "amount": money_str(e.amount)}
             for e in reversed_entries
         ],
     }
@@ -740,7 +749,7 @@ def get_transactions(account_id: int, db: Session = Depends(get_db), page: int =
             "type": entry.transaction.type,                # DEPOSIT, WITHDRAWAL, TRANSFER or REVERSAL
             "reversal_of": entry.transaction.reversal_of,  # id of the undone transaction, else null
             "entry_type": entry.entry_type,   # DEBIT or CREDIT
-            "amount": entry.amount,
+            "amount": money_str(entry.amount),
             "description": entry.transaction.description,  # e.g. "Deposit", "Withdrawal", "Transfer"
             "created_at": entry.transaction.created_at
         })
