@@ -212,7 +212,7 @@ It compares each account's stored balance with its ledger entries (credits minus
 - API on port 8000. Interactive docs at `/docs`.
 
 **3. Startup setup.**
-- `entrypoint.sh` is meant to run `app/create_table.py`.
+- On container start, `entrypoint.sh` runs `app/create_table.py` before the API starts.
 - It creates the tables and one EXTERNAL account per supported currency (USD, SGD).
 - Deposit and withdraw assume those accounts exist. If one is missing they return 500.
 

@@ -17,4 +17,6 @@ COPY . .
 EXPOSE 8000
 ENV PYTHONUNBUFFERED=1
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Run entrypoint.sh (creates tables and EXTERNAL accounts, then starts the API).
+# Called through sh so it works even if the file lacks the executable bit.
+CMD ["sh", "./entrypoint.sh"]
