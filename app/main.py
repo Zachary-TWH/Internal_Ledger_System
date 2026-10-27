@@ -114,7 +114,7 @@ def get_db():
 def flush_or_409(db: Session):
     """Send the pending INSERTs to the database, turning a duplicate idempotency_key into a 409."""
     try:
-        db.flush()
+        db.flush() 
     except IntegrityError:
         db.rollback()
         raise HTTPException(status_code=409, detail="Duplicate request")
