@@ -17,6 +17,11 @@ Safety rules used by every write endpoint
 - Atomicity: ledger entries and balance changes are committed together (all or nothing).
 """
 
+import json
+import urllib.error
+import urllib.parse
+import urllib.request
+
 from fastapi import FastAPI, Depends, HTTPException
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, field_validator
@@ -30,6 +35,10 @@ from decimal import Decimal
 
 
 SUPPORTED_CURRENCIES = ["USD", "SGD"]
+
+# Free, no-API-key FX rate service (European Central Bank reference rates, updated on working days)
+FRANKFURTER_URL = "https://api.frankfurter.dev/v1/latest"
+FX_TIMEOUT_SECONDS = 5
 
 app = FastAPI()
 
@@ -427,6 +436,85 @@ def get_transactions(account_id: int, db: Session = Depends(get_db), page: int =
         "page_size": page_size,
         "order": order,
         "results": result
+    }
+
+
+# ---------------------------------------------------------------------------
+# FX conversion (live rate from the Frankfurter API)
+# ---------------------------------------------------------------------------
+
+@app.get("/fx/convert")
+def fx_convert(from_currency: str, to_currency: str, amount: Decimal = Decimal("1")):
+    """Convert an amount between two supported currencies using a live Frankfurter rate.
+
+    Query params: from_currency (e.g. USD), to_currency (e.g. SGD), amount (default 1).
+    Example: GET /fx/convert?from_currency=USD&to_currency=SGD&amount=100
+
+    Read-only: it does not touch any account or stored exchange rate. The rate is
+    parsed as a Decimal (never float) and the result is rounded to 2 decimal places.
+
+    Returns: {"from_currency", "to_currency", "amount", "rate", "converted_amount",
+              "rate_date", "source"}
+    Errors:
+      400  unsupported currency, or amount is not greater than zero
+      502  Frankfurter returned an error or an unexpected response
+      504  Frankfurter did not answer in time
+    """
+    from_currency = from_currency.upper()
+    to_currency = to_currency.upper()
+
+    for ccy in (from_currency, to_currency):
+        if ccy not in SUPPORTED_CURRENCIES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported currency {ccy}. Supported: {', '.join(SUPPORTED_CURRENCIES)}",
+            )
+    if amount <= 0:
+        raise HTTPException(status_code=400, detail="Amount must be greater than zero")
+
+    # same currency: nothing to look up
+    if from_currency == to_currency:
+        return {
+            "from_currency": from_currency,
+            "to_currency": to_currency,
+            "amount": str(amount),
+            "rate": "1",
+            "converted_amount": str(amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)),
+            "rate_date": None,
+            "source": None,
+        }
+
+    # e.g. https://api.frankfurter.dev/v1/latest?base=USD&symbols=SGD
+    query = urllib.parse.urlencode({"base": from_currency, "symbols": to_currency})
+    request = urllib.request.Request(f"{FRANKFURTER_URL}?{query}", headers={"Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=FX_TIMEOUT_SECONDS) as response:
+            # parse_float=Decimal keeps the rate exact instead of turning it into a float
+            payload = json.loads(response.read().decode("utf-8"), parse_float=Decimal)
+        rate = Decimal(str(payload["rates"][to_currency]))
+        rate_date = payload.get("date")
+    except TimeoutError:
+        raise HTTPException(status_code=504, detail="FX rate service timed out")
+    except urllib.error.URLError as exc:
+        # URLError covers HTTPError (non-2xx) and network failures; a timeout during connect lands here too
+        if isinstance(getattr(exc, "reason", None), TimeoutError):
+            raise HTTPException(status_code=504, detail="FX rate service timed out")
+        raise HTTPException(status_code=502, detail="FX rate service unavailable")
+    except (KeyError, ValueError, TypeError, ArithmeticError):
+        raise HTTPException(status_code=502, detail="FX rate service returned an unexpected response")
+
+    if rate <= 0:
+        raise HTTPException(status_code=502, detail="FX rate service returned an invalid rate")
+
+    converted = (amount * rate).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    return {
+        "from_currency": from_currency,
+        "to_currency": to_currency,
+        "amount": str(amount),
+        "rate": str(rate),
+        "converted_amount": str(converted),
+        "rate_date": rate_date,
+        "source": "frankfurter.dev",
     }
 
 
