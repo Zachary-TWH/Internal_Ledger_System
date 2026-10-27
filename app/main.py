@@ -277,6 +277,7 @@ def deposit(req: DepositRequest, db: Session = Depends(get_db)):
     Errors:
       409  idempotency_key was already used
       404  account not found
+      400  the account is a system account (EXTERNAL or FX_POSITION), which customers cannot use
       500  the EXTERNAL account has not been created
     """
     # idempotency check: has this exact request been processed before?
@@ -288,6 +289,8 @@ def deposit(req: DepositRequest, db: Session = Depends(get_db)):
     account = db.query(models.Account).filter_by(id=req.account_id).with_for_update().first()
     if not account:
         raise HTTPException(status_code=404, detail="Account not found")
+    if account.is_system:
+        raise HTTPException(status_code=400, detail="System accounts cannot be used here")
 
     # lock this currency's EXTERNAL account too (after the user's row, always in this order)
     external = lock_system_account(db, "EXTERNAL", account.currency)
@@ -337,6 +340,7 @@ def withdraw(req: WithdrawalRequest, db: Session = Depends(get_db)):
     Errors:
       409  idempotency_key was already used
       404  account not found
+      400  the account is a system account (EXTERNAL or FX_POSITION), which customers cannot use
       400  insufficient funds
       500  the EXTERNAL account has not been created
     """
@@ -351,6 +355,8 @@ def withdraw(req: WithdrawalRequest, db: Session = Depends(get_db)):
     account = db.query(models.Account).filter_by(id=req.account_id).with_for_update().first()
     if not account:
         raise HTTPException(status_code=404, detail="Account not found")
+    if account.is_system:
+        raise HTTPException(status_code=400, detail="System accounts cannot be used here")
    
     # lock this currency's EXTERNAL account too (after the user's row, always in this order)
     external = lock_system_account(db, "EXTERNAL", account.currency)
@@ -421,6 +427,7 @@ def transfer(req: TransferRequest, db: Session = Depends(get_db)):
       409  idempotency_key was already used
       400  same source and destination account
       404  an account was not found
+      400  either account is a system account (EXTERNAL or FX_POSITION), which customers cannot use
       400  insufficient funds in the source account
       503  cross-currency transfer and the live FX rate is unavailable (nothing is recorded)
     """
@@ -436,14 +443,20 @@ def transfer(req: TransferRequest, db: Session = Depends(get_db)):
     # Work out whether this is a cross-currency transfer BEFORE locking anything.
     # We select plain columns (not Account objects) so no stale balance is cached in this
     # session; the locked read below is the only one that loads balances. A currency never
-    # changes after an account is created, so reading it without a lock is safe.
-    currencies = dict(
-        db.query(models.Account.id, models.Account.currency)
+    # changes after an account is created, so reading it without a lock is safe. The same goes
+    # for is_system, which is set when the account is created and never changes.
+    rows = (
+        db.query(models.Account.id, models.Account.currency, models.Account.is_system)
         .filter(models.Account.id.in_([req.from_account_id, req.to_account_id]))
         .all()
     )
-    if len(currencies) != 2:
+    if len(rows) != 2:
         raise HTTPException(status_code=404, detail="Account not found")
+    # System accounts (EXTERNAL, FX_POSITION) only move through the code paths that post to
+    # them. Refuse here, before any FX call or row lock.
+    if any(row.is_system for row in rows):
+        raise HTTPException(status_code=400, detail="System accounts cannot be used here")
+    currencies = {row.id: row.currency for row in rows}
 
     exchange_rate_used = None
     if currencies[req.from_account_id] != currencies[req.to_account_id]:

@@ -306,6 +306,68 @@ def test_deposit_needs_a_real_system_account_not_a_customer_called_external():
 
 
 # ---------------------------------------------------------------------------
+# System accounts cannot be used by the customer endpoints
+# ---------------------------------------------------------------------------
+
+def system_account_id(owner_name, currency):
+    db = SessionLocal()
+    try:
+        return db.query(models.Account).filter_by(owner_name=owner_name, currency=currency, is_system=True).one().id
+    finally:
+        db.close()
+
+
+def test_deposit_into_a_system_account_is_rejected():
+    external = system_account_id("EXTERNAL", "USD")
+
+    assert post_deposit(external, 100, "d1").status_code == 400
+    assert system_balance("EXTERNAL", "USD") == 0
+    assert count_rows(models.Transaction) == 0 and count_rows(models.LedgerEntry) == 0
+
+
+def test_withdraw_from_a_system_account_is_rejected():
+    fx_position = system_account_id("FX_POSITION", "USD")
+
+    assert post_withdraw(fx_position, 100, "w1").status_code == 400
+    assert system_balance("FX_POSITION", "USD") == 0
+    assert count_rows(models.Transaction) == 0 and count_rows(models.LedgerEntry) == 0
+
+
+def test_transfer_from_or_to_a_system_account_is_rejected():
+    alice = new_account("alice")
+    deposit(alice, 100, "seed")
+    external = system_account_id("EXTERNAL", "USD")
+    transactions_before = count_rows(models.Transaction)
+
+    assert post_transfer(alice, external, 10, "t1").status_code == 400    # customer -> system
+    assert post_transfer(external, alice, 10, "t2").status_code == 400    # system -> customer
+    assert balance_of(alice) == 100 and system_balance("EXTERNAL", "USD") == Decimal("-100.00")
+    assert count_rows(models.Transaction) == transactions_before
+
+
+def test_transfer_to_a_system_account_is_refused_before_any_fx_call():
+    alice = new_account("alice")                       # USD
+    deposit(alice, 100, "seed")
+    fx_position_sgd = system_account_id("FX_POSITION", "SGD")
+    FETCH_CALLS.clear()
+
+    assert post_transfer(alice, fx_position_sgd, 10, "t1").status_code == 400
+    assert FETCH_CALLS == []                           # a USD -> SGD pair would have called the service
+    assert balance_of(alice) == 100
+
+
+def test_system_accounts_can_still_be_read():
+    external = system_account_id("EXTERNAL", "USD")
+    alice = new_account("alice")
+    deposit(alice, 100, "d1")
+
+    account = client.get(f"/accounts/{external}").json()
+    assert account["owner_name"] == "EXTERNAL" and Decimal(account["balance"]) == Decimal("-100.00")
+    history = client.get(f"/accounts/{external}/transactions").json()["results"]
+    assert len(history) == 1 and history[0]["entry_type"] == "DEBIT"
+
+
+# ---------------------------------------------------------------------------
 # POST /deposit
 # ---------------------------------------------------------------------------
 

@@ -40,6 +40,7 @@ Each assumption below is a rule the ledger follows. Examples use made-up numbers
 **6. System accounts: EXTERNAL and FX_POSITION.**
 - Two kinds of system account exist, one of each per supported currency, so four in total for USD and SGD. They are created at startup (`is_system = true`).
 - Users cannot create them through the API.
+- `/deposit`, `/withdraw` and `/transfer` refuse them (400) as source, destination or target account, so only the code paths that post to them can move them. `/transfer` checks this in its early read, before any FX call or row lock. Reads (`GET /accounts/{id}` and its history) stay open, so EXTERNAL and FX_POSITION balances can still be audited.
 - **EXTERNAL** represents the outside world. Deposits and withdrawals go through it.
 - **FX_POSITION** represents the bank's own currency-exchange counter. It is the account that both sides of a cross-currency conversion go through, so each currency's ledger can net to zero on its own. It is kept separate from EXTERNAL so EXTERNAL keeps one clear meaning: the net money that entered or left the system from outside.
 - Adding system accounts for another currency is currently not supported. They are only created at startup for USD and SGD, so a new currency has no EXTERNAL account and deposits and withdrawals in it fail.
