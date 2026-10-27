@@ -42,18 +42,28 @@ Each assumption below is a rule the ledger follows. Examples use made-up numbers
 - Example: deposit 100 USD, then withdraw 40 USD. EXTERNAL USD ledger balance is -60.
 
 **7. Transfer amount is in the source account's currency.**
-- Same currency: destination gets the same amount.
-- Different currency: the destination gets the amount times the latest stored rate (source to destination).
+- Same currency: destination gets the same amount. The FX service is never called.
+- Different currency: the live rate (source to destination) is fetched from the Frankfurter API when the transfer runs, and the destination gets the amount times that rate, rounded to 2 decimals (half up).
 - Example: send 100 USD at 1.35. The destination receives 135.00 SGD.
-- The rate used is saved on the transaction (`exchange_rate_used`), so later rate changes do not alter history.
-- No rate stored for the pair: the transfer is rejected (400).
+- There is **no exchange-rate table**. Only the rate that was actually executed is stored, on the transaction (`exchange_rate_used`, 6 decimals). The rate used is the rate saved, and later rate moves never alter history. It is also what a reversal should reuse, and what month-end reconciliation checks against.
+- **Fail closed.** If the rate cannot be fetched (timeout after 5 seconds, error, malformed or non-positive rate), the cross-currency transfer is rejected with 503 and nothing is recorded. A stale or guessed rate is never used. Same-currency transfers, deposits and withdrawals keep working. Because nothing was recorded, the client can retry with the same idempotency key.
+- **The rate is fetched before any row lock is taken** (after the idempotency check). A slow or hanging FX service therefore never holds up other transfers on those accounts. The only thing read before locking is the account currencies, which never change after creation. Balances are only read after the lock.
 - Only the direct pair is used. No inverse rates, no triangulation.
-- Rates are seeded or inserted by hand. There is no live rate feed.
+- `GET /fx/convert?from_currency=USD&to_currency=SGD&amount=100` is a read-only quote tool. It uses the same fetch and stores nothing.
+
+**Assumption about the FX source.** Frankfurter publishes European Central Bank reference rates, updated once per working day (about 16:00 CET). The service is up around the clock, but the rate is a daily reference rate, not a live market price. On weekends the last working-day rate is returned. It is free and has no uptime guarantee. This is acceptable for this assignment. A real bank would use a paid quote feed with a service-level agreement.
+
+**Not implemented (FX).**
+- No quote-then-confirm step. The customer cannot see the rate before the transfer runs, because the rate is chosen at execution. I would add a short-lived quote (id, rate, expiry) that the transfer must reference, so the customer agrees to a specific rate.
+- No spread or fee on the rate.
+- No fallback provider. A second provider, tried only when the first fails, would raise availability without ever using an old rate.
+- No retries. A single 5 second attempt keeps the request short, and the client can retry.
+- No check on rate age. Frankfurter returns a `date`, and a production system should reject a rate older than an agreed limit (for example more than 4 days, which still covers a long weekend).
 
 **8. A cross-currency transfer uses two entries, not four.**
 - Debit is in the source currency, credit is in the destination currency.
 - So total debits and total credits are not equal across the whole ledger, by design.
-- Reconciliation checks each transaction instead: credit = debit x stored rate.
+- Reconciliation checks each transaction instead: credit = debit x the rate saved on that transaction.
 - A production design would route through one FX position account per currency, so each currency nets to zero on its own. See the limitations below.
 
 **9. Overdrafts are not allowed.**
@@ -206,7 +216,7 @@ It compares each account's stored balance with its ledger entries (credits minus
 - Not implemented: saving each run in a `reconciliation_runs` table for an audit trail, and the scheduled job.
 
 **6. Tests.**
-- **Endpoint tests:** `tests/test_ledger_endpoints.py`. Covers `/deposit`, `/withdraw`, `/transfer`, `GET /accounts/{id}`, the transaction history and the reconciliation endpoint.
+- **Endpoint tests:** `tests/test_ledger_endpoints.py`. Covers `/deposit`, `/withdraw`, `/transfer`, `GET /accounts/{id}`, the transaction history and the reconciliation endpoint and `/fx/convert`. The FX service is faked in every test (the network is never called), including a failing service (503 and nothing recorded). The real fetch function is tested separately against canned responses: valid, malformed, timeout and HTTP error.
 - **Concurrency and rounding tests:** `tests/test_postgres_concurrency.py`. They need real Postgres, because SQLite ignores `SELECT ... FOR UPDATE` and does not round to 2 decimals.
 - They cover 20 parallel deposits into one account, 20 parallel withdrawals that must never overdraw, opposite-direction transfers with no deadlock, 10 identical simultaneous requests, and rounding of a converted amount (0.10 USD at 1.35 becomes 0.14 SGD).
 - They use a temporary SQLite database, so no Postgres is needed.
@@ -250,7 +260,7 @@ It compares each account's stored balance with its ledger entries (credits minus
 **1. Language.** The brief prefers Java. This is Python (FastAPI, SQLAlchemy, Postgres).
 **2. Reversals and the integrity check.** Designed above, not built.
 **3. Idempotency.** A reused key returns 409. Better: return the original result, and reject only if the details differ.
-**4. Exchange rates.** No live feed, no staleness limit, no inverse or triangulated rates.
+**4. Exchange rates.** Live rate from a free daily-reference service (Frankfurter), fetched per cross-currency transfer. Cross-currency transfers depend on that third party and are refused when it is down. No quote step, no spread, no fallback provider, no rate-age limit, no inverse or triangulated rates. See assumption 7.
 **5. Pagination.** Page and offset. Keyset pagination is better for large histories.
 **6. Security.** No authentication or account ownership checks.
 **7. Operations.** No audit log, monitoring or scheduled reconciliation.

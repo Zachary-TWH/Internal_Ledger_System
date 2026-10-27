@@ -21,27 +21,48 @@ os.environ["DATABASE_URL"] = f"sqlite:///{_db_file}"
 import pytest
 from fastapi.testclient import TestClient
 
-from app.main import app
+import urllib.error
+
+from app.main import app, FxRateError
+from app import main as app_main
 from app.database import SessionLocal, Base, engine
 from app import models
 
 client = TestClient(app)
+
+# The real fetch_fx_rate calls the Frankfurter API. Tests never touch the network: the
+# fixture below swaps it for a fake that reads these rates. Delete an entry to simulate
+# the service failing for that pair; change one to simulate the market moving.
+REAL_FETCH_FX_RATE = app_main.fetch_fx_rate
+FAKE_RATES = {}
+FETCH_CALLS = []
+
+
+def fake_fetch_fx_rate(from_currency, to_currency):
+    FETCH_CALLS.append((from_currency, to_currency))
+    if (from_currency, to_currency) not in FAKE_RATES:
+        raise FxRateError("FX rate service unavailable")
+    return FAKE_RATES[(from_currency, to_currency)], "2026-10-27"
 # Transactions are stamped by the database clock (UTC), so use UTC here too. A local
 # clock can name a different month near midnight on the 1st and make the tests flaky.
 THIS_MONTH = datetime.now(timezone.utc).strftime("%Y-%m")
 
 
 @pytest.fixture(autouse=True)
-def fresh_db():
-    """Empty tables, then the two EXTERNAL system accounts (as create_table.py seeds them)."""
+def fresh_db(monkeypatch):
+    """Empty tables, the two EXTERNAL system accounts (as create_table.py seeds them),
+    and a fake live FX rate (USD -> SGD 1.35, SGD -> USD 0.74)."""
     Base.metadata.drop_all(bind=engine)
     Base.metadata.create_all(bind=engine)
     db = SessionLocal()
     for ccy in ("USD", "SGD"):
         db.add(models.Account(owner_name="EXTERNAL", currency=ccy, balance=0, is_system=True))
-    db.add(models.ExchangeRate(base_currency="USD", quote_currency="SGD", rate=Decimal("1.350000")))
     db.commit()
     db.close()
+    FAKE_RATES.clear()
+    FAKE_RATES.update({("USD", "SGD"): Decimal("1.350000"), ("SGD", "USD"): Decimal("0.740000")})
+    FETCH_CALLS.clear()
+    monkeypatch.setattr(app_main, "fetch_fx_rate", fake_fetch_fx_rate)
     yield
 
 
@@ -312,7 +333,7 @@ def test_transfer_same_currency_updates_both_balances_and_writes_two_entries():
     assert by_type["DEBIT"].amount == by_type["CREDIT"].amount == Decimal("30.00")
 
 
-def test_transfer_cross_currency_converts_with_stored_rate():
+def test_transfer_cross_currency_converts_with_live_rate():
     alice, bob_sgd = new_account("alice"), new_account("bob", "SGD")
     deposit(alice, 100, "d1")
 
@@ -387,16 +408,38 @@ def test_transfer_unknown_account_returns_404_and_nothing_changes():
     assert count_rows(models.Transaction) == 1
 
 
-def test_transfer_without_stored_rate_returns_400():
-    # the fixture only seeds USD -> SGD, so SGD -> USD has no rate
+def test_transfer_cross_currency_returns_503_when_rate_service_is_down():
     bob_sgd, alice = new_account("bob", "SGD"), new_account("alice")
     deposit(bob_sgd, 100, "d1")
+    FAKE_RATES.clear()                                   # the FX service is down
 
     r = post_transfer(bob_sgd, alice, 10, "t1")
 
-    assert r.status_code == 400
+    assert r.status_code == 503                          # fail closed: no guessed or old rate
     assert balance_of(bob_sgd) == 100 and balance_of(alice) == 0
-    assert count_rows(models.Transaction) == 1
+    assert count_rows(models.Transaction) == 1           # only the deposit: nothing recorded
+
+    # the failed request left nothing behind, so the same key works once the service is back
+    FAKE_RATES[("SGD", "USD")] = Decimal("0.740000")
+    assert post_transfer(bob_sgd, alice, 10, "t1").status_code == 200
+    assert balance_of(bob_sgd) == 90 and balance_of(alice) == 7.4          # 10 SGD x 0.74
+
+
+def test_same_currency_transfer_never_calls_the_rate_service():
+    alice, bob = new_account("alice"), new_account("bob")
+    deposit(alice, 100, "d1")
+    FAKE_RATES.clear()                                   # even with the FX service down
+
+    assert post_transfer(alice, bob, 30, "t1").status_code == 200
+    assert FETCH_CALLS == []
+
+
+def test_transfer_to_unknown_account_does_not_call_the_rate_service():
+    alice = new_account("alice")
+    deposit(alice, 100, "d1")
+
+    assert post_transfer(alice, 9999, 10, "t1").status_code == 404
+    assert FETCH_CALLS == []
 
 
 @pytest.mark.parametrize("bad_amount", [0, -10])
@@ -413,14 +456,8 @@ def test_rate_change_after_transfer_does_not_alter_past_transaction():
     deposit(alice, 100, "d1")
     first = post_transfer(alice, bob_sgd, 40, "t1").json()      # at 1.35 -> 54.00 SGD
 
-    # a newer rate (dated tomorrow, so it is the latest) is added
-    db = SessionLocal()
-    db.add(models.ExchangeRate(
-        base_currency="USD", quote_currency="SGD", rate=Decimal("1.500000"),
-        fetched_at=datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(days=1),
-    ))
-    db.commit()
-    db.close()
+    # the market moves
+    FAKE_RATES[("USD", "SGD")] = Decimal("1.500000")
     second = post_transfer(alice, bob_sgd, 40, "t2").json()     # at 1.50 -> 60.00 SGD
 
     assert second["exchange_rate_used"] == 1.5
@@ -511,3 +548,92 @@ def test_history_invalid_order_returns_422():
     alice = new_account("alice")
 
     assert history(alice, order="sideways").status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# GET /fx/convert and the real fetch_fx_rate (the network is faked, never called)
+# ---------------------------------------------------------------------------
+
+def test_fx_convert_returns_rate_and_rounded_amount():
+    FAKE_RATES[("USD", "SGD")] = Decimal("1.291234")
+
+    r = client.get("/fx/convert", params={"from_currency": "usd", "to_currency": "SGD", "amount": "10.01"})
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body["rate"] == "1.291234" and body["converted_amount"] == "12.93"   # 12.92... rounds up
+    assert body["from_currency"] == "USD" and body["rate_date"] == "2026-10-27"
+
+
+def test_fx_convert_same_currency_needs_no_lookup():
+    r = client.get("/fx/convert", params={"from_currency": "USD", "to_currency": "USD", "amount": "5"})
+
+    assert r.status_code == 200 and r.json()["converted_amount"] == "5.00"
+    assert FETCH_CALLS == []
+
+
+@pytest.mark.parametrize("params", [
+    {"from_currency": "EUR", "to_currency": "SGD", "amount": "1"},     # unsupported currency
+    {"from_currency": "USD", "to_currency": "SGD", "amount": "0"},     # not positive
+])
+def test_fx_convert_rejects_bad_input(params):
+    assert client.get("/fx/convert", params=params).status_code == 400
+
+
+def test_fx_convert_returns_502_when_service_is_down():
+    FAKE_RATES.clear()
+
+    r = client.get("/fx/convert", params={"from_currency": "USD", "to_currency": "SGD"})
+
+    assert r.status_code == 502
+
+
+class _FakeResponse:
+    """Stands in for the object urllib.request.urlopen returns."""
+
+    def __init__(self, body: bytes):
+        self._body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self):
+        return self._body
+
+
+def test_real_fetch_parses_frankfurter_response(monkeypatch):
+    body = b'{"amount":1.0,"base":"USD","date":"2026-10-27","rates":{"SGD":1.2912}}'
+    monkeypatch.setattr(app_main.urllib.request, "urlopen", lambda req, timeout: _FakeResponse(body))
+
+    rate, rate_date = REAL_FETCH_FX_RATE("USD", "SGD")
+
+    assert rate == Decimal("1.291200") and rate_date == "2026-10-27"   # Decimal, 6 places, not a float
+
+
+@pytest.mark.parametrize("body", [b"not json", b'{"rates":{}}', b'{"rates":{"SGD":0}}', b'{"rates":{"SGD":"abc"}}'])
+def test_real_fetch_rejects_bad_responses(monkeypatch, body):
+    monkeypatch.setattr(app_main.urllib.request, "urlopen", lambda req, timeout: _FakeResponse(body))
+
+    with pytest.raises(FxRateError):
+        REAL_FETCH_FX_RATE("USD", "SGD")
+
+
+def test_real_fetch_reports_timeout_and_http_errors(monkeypatch):
+    def timeout(req, timeout):
+        raise TimeoutError()
+
+    def server_error(req, timeout):
+        raise urllib.error.HTTPError(req.full_url, 500, "boom", {}, None)
+
+    monkeypatch.setattr(app_main.urllib.request, "urlopen", timeout)
+    with pytest.raises(FxRateError) as slow:
+        REAL_FETCH_FX_RATE("USD", "SGD")
+    assert slow.value.timed_out is True
+
+    monkeypatch.setattr(app_main.urllib.request, "urlopen", server_error)
+    with pytest.raises(FxRateError) as down:
+        REAL_FETCH_FX_RATE("USD", "SGD")
+    assert down.value.timed_out is False

@@ -40,6 +40,48 @@ SUPPORTED_CURRENCIES = ["USD", "SGD"]
 FRANKFURTER_URL = "https://api.frankfurter.dev/v1/latest"
 FX_TIMEOUT_SECONDS = 5
 
+
+class FxRateError(Exception):
+    """The live FX rate could not be obtained. `timed_out` is True when the service was too slow."""
+
+    def __init__(self, message: str, timed_out: bool = False):
+        super().__init__(message)
+        self.message = message
+        self.timed_out = timed_out
+
+
+def fetch_fx_rate(from_currency: str, to_currency: str):
+    """Fetch the live rate (1 from_currency = rate to_currency) from Frankfurter.
+
+    Returns (rate, rate_date). The rate is a Decimal rounded to 6 places, the scale of
+    transactions.exchange_rate_used, so the rate we use is exactly the rate we store.
+    Raises FxRateError on any network, HTTP or response-format problem. Never returns a
+    guessed or cached rate: if the service cannot be reached, the caller must refuse the request.
+    """
+    # e.g. https://api.frankfurter.dev/v1/latest?base=USD&symbols=SGD
+    query = urllib.parse.urlencode({"base": from_currency, "symbols": to_currency})
+    request = urllib.request.Request(f"{FRANKFURTER_URL}?{query}", headers={"Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=FX_TIMEOUT_SECONDS) as response:
+            # parse_float=Decimal keeps the rate exact instead of turning it into a float
+            payload = json.loads(response.read().decode("utf-8"), parse_float=Decimal)
+        rate = Decimal(str(payload["rates"][to_currency])).quantize(Decimal("0.000001"))
+        rate_date = payload.get("date")
+    except TimeoutError:
+        raise FxRateError("FX rate service timed out", timed_out=True)
+    except urllib.error.URLError as exc:
+        # URLError covers HTTPError (non-2xx) and network failures; a connect timeout lands here too
+        if isinstance(getattr(exc, "reason", None), TimeoutError):
+            raise FxRateError("FX rate service timed out", timed_out=True)
+        raise FxRateError("FX rate service unavailable")
+    except (KeyError, ValueError, TypeError, ArithmeticError):
+        raise FxRateError("FX rate service returned an unexpected response")
+
+    if rate <= 0:
+        raise FxRateError("FX rate service returned an invalid rate")
+    return rate, rate_date
+
+
 app = FastAPI()
 
 Base.metadata.create_all(bind=engine)
@@ -265,8 +307,14 @@ async def transfer(req: TransferRequest, db: Session = Depends(get_db)):
     """Move money from one account to another in a single atomic operation.
 
     `amount` is in the source account's currency. If the two accounts use different
-    currencies, the latest stored ExchangeRate (source -> destination) converts it,
-    and the destination is credited the converted amount in its own currency.
+    currencies, a live rate (source -> destination) is fetched from the Frankfurter API at
+    execution time, and the destination is credited the converted amount (rounded to 2 dp)
+    in its own currency. No rates are kept in a table: only the rate actually used is saved,
+    on the transaction (`exchange_rate_used`).
+
+    The rate is fetched BEFORE any row lock is taken, so a slow FX service never holds up
+    other transfers on these accounts. If the rate cannot be fetched the transfer is refused
+    (fail closed); a stale or guessed rate is never used. Same-currency transfers never call the API.
 
     Ledger entries: DEBIT source (amount), CREDIT destination (credited_amount).
 
@@ -277,7 +325,7 @@ async def transfer(req: TransferRequest, db: Session = Depends(get_db)):
       400  same source and destination account
       404  an account was not found
       400  insufficient funds in the source account
-      400  no exchange rate stored for the currency pair
+      503  cross-currency transfer and the live FX rate is unavailable (nothing is recorded)
     """
     # check if this exact transfer was already processed before
     existing = db.query(models.Transaction).filter_by(idempotency_key=req.idempotency_key).first()
@@ -287,6 +335,28 @@ async def transfer(req: TransferRequest, db: Session = Depends(get_db)):
     # prevent transferring to yourself
     if req.from_account_id == req.to_account_id:
         raise HTTPException(status_code=400, detail="Cannot transfer to the same account")
+
+    # Work out whether this is a cross-currency transfer BEFORE locking anything.
+    # We select plain columns (not Account objects) so no stale balance is cached in this
+    # session; the locked read below is the only one that loads balances. A currency never
+    # changes after an account is created, so reading it without a lock is safe.
+    currencies = dict(
+        db.query(models.Account.id, models.Account.currency)
+        .filter(models.Account.id.in_([req.from_account_id, req.to_account_id]))
+        .all()
+    )
+    if len(currencies) != 2:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    exchange_rate_used = None
+    if currencies[req.from_account_id] != currencies[req.to_account_id]:
+        # Network call happens here, with no row locks held. Fail closed if it does not work.
+        try:
+            exchange_rate_used, _rate_date = fetch_fx_rate(
+                currencies[req.from_account_id], currencies[req.to_account_id]
+            )
+        except FxRateError as exc:
+            raise HTTPException(status_code=503, detail=f"Cannot transfer across currencies right now: {exc.message}")
 
     # always lock in consistent id order to prevent deadlocks
     # (e.g. A->B and B->A at the same time both lock the lower id first)
@@ -308,25 +378,13 @@ async def transfer(req: TransferRequest, db: Session = Depends(get_db)):
     if from_account.balance < req.amount:
         raise HTTPException(status_code=400, detail="Insufficient funds")
 
-    # same currency: no conversion needed
-    if from_account.currency == to_account.currency:
-        exchange_rate_used = None
+    if exchange_rate_used is None:
+        # same currency: no conversion needed
         credited_amount = req.amount
     else:
-        # different currencies: look up the most recent rate we've stored
-        rate_row = (
-            db.query(models.ExchangeRate)
-            .filter_by(base_currency=from_account.currency, quote_currency=to_account.currency)
-            .order_by(models.ExchangeRate.fetched_at.desc())
-            .first()
-        )
-        if not rate_row:
-            raise HTTPException(
-                status_code=400,
-                detail=f"No exchange rate available for {from_account.currency} -> {to_account.currency}"
-            )
-        exchange_rate_used = rate_row.rate
-        credited_amount = req.amount * exchange_rate_used
+        # different currencies: convert with the live rate fetched above, rounded to the
+        # 2 decimal places every amount is stored at (so the entry and the balance agree)
+        credited_amount = (req.amount * exchange_rate_used).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
     # create one transaction record grouping both ledger entries together
     txn = models.Transaction(
@@ -450,8 +508,9 @@ def fx_convert(from_currency: str, to_currency: str, amount: Decimal = Decimal("
     Query params: from_currency (e.g. USD), to_currency (e.g. SGD), amount (default 1).
     Example: GET /fx/convert?from_currency=USD&to_currency=SGD&amount=100
 
-    Read-only: it does not touch any account or stored exchange rate. The rate is
-    parsed as a Decimal (never float) and the result is rounded to 2 decimal places.
+    Read-only quote tool: it does not touch any account or the ledger. Nothing is stored; /transfer
+    fetches its own live rate at execution time and saves only the rate it actually used.
+    The rate is parsed as a Decimal (never float) and the result is rounded to 2 decimal places.
 
     Returns: {"from_currency", "to_currency", "amount", "rate", "converted_amount",
               "rate_date", "source"}
@@ -484,27 +543,10 @@ def fx_convert(from_currency: str, to_currency: str, amount: Decimal = Decimal("
             "source": None,
         }
 
-    # e.g. https://api.frankfurter.dev/v1/latest?base=USD&symbols=SGD
-    query = urllib.parse.urlencode({"base": from_currency, "symbols": to_currency})
-    request = urllib.request.Request(f"{FRANKFURTER_URL}?{query}", headers={"Accept": "application/json"})
     try:
-        with urllib.request.urlopen(request, timeout=FX_TIMEOUT_SECONDS) as response:
-            # parse_float=Decimal keeps the rate exact instead of turning it into a float
-            payload = json.loads(response.read().decode("utf-8"), parse_float=Decimal)
-        rate = Decimal(str(payload["rates"][to_currency]))
-        rate_date = payload.get("date")
-    except TimeoutError:
-        raise HTTPException(status_code=504, detail="FX rate service timed out")
-    except urllib.error.URLError as exc:
-        # URLError covers HTTPError (non-2xx) and network failures; a timeout during connect lands here too
-        if isinstance(getattr(exc, "reason", None), TimeoutError):
-            raise HTTPException(status_code=504, detail="FX rate service timed out")
-        raise HTTPException(status_code=502, detail="FX rate service unavailable")
-    except (KeyError, ValueError, TypeError, ArithmeticError):
-        raise HTTPException(status_code=502, detail="FX rate service returned an unexpected response")
-
-    if rate <= 0:
-        raise HTTPException(status_code=502, detail="FX rate service returned an invalid rate")
+        rate, rate_date = fetch_fx_rate(from_currency, to_currency)
+    except FxRateError as exc:
+        raise HTTPException(status_code=504 if exc.timed_out else 502, detail=exc.message)
 
     converted = (amount * rate).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
     return {

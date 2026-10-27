@@ -26,6 +26,7 @@ os.environ["DATABASE_URL"] = _url      # must be set before app.main is imported
 from fastapi.testclient import TestClient
 
 from app.main import app
+from app import main as app_main
 from app.database import SessionLocal, Base, engine
 from app import models
 
@@ -36,16 +37,17 @@ if engine.dialect.name != "postgresql":
 
 
 @pytest.fixture(autouse=True)
-def fresh_db():
-    """Empty tables, then the EXTERNAL system accounts and one USD -> SGD rate."""
+def fresh_db(monkeypatch):
+    """Empty tables, then the EXTERNAL system accounts. The live FX rate is faked at USD -> SGD 1.35."""
     Base.metadata.drop_all(bind=engine)
     Base.metadata.create_all(bind=engine)
     db = SessionLocal()
     for ccy in ("USD", "SGD"):
         db.add(models.Account(owner_name="EXTERNAL", currency=ccy, balance=0, is_system=True))
-    db.add(models.ExchangeRate(base_currency="USD", quote_currency="SGD", rate=Decimal("1.350000")))
     db.commit()
     db.close()
+    # no network in tests: the transfer endpoint gets a fixed rate instead of calling Frankfurter
+    monkeypatch.setattr(app_main, "fetch_fx_rate", lambda frm, to: (Decimal("1.350000"), "2026-10-27"))
     yield
 
 

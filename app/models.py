@@ -1,4 +1,4 @@
-"""SQLAlchemy models for the financial ledger and FX rate storage.
+"""SQLAlchemy models for the financial ledger.
 
 These models define the database schema. They do not implement transaction
 processing, balance updates, FX pricing, or netting logic.
@@ -56,7 +56,8 @@ class Transaction(Base):
 
     `idempotency_key` prevents duplicate processing when enforced by the
     transaction-processing service and database constraint.
-    `exchange_rate_used` records the rate applied, when relevant.
+    `exchange_rate_used` records the live FX rate actually applied to a cross-currency
+    transfer (null otherwise). It is the only place a rate is stored: there is no rates table.
     """
 
     __tablename__ = "transactions"
@@ -100,22 +101,3 @@ class LedgerEntry(Base):
 
     transaction = relationship("Transaction", back_populates="entries")
     account = relationship("Account")
-
-
-class ExchangeRate(Base):
-    """A stored FX market-rate observation.
-
-    Each row represents a rate for a currency pair at a particular time.
-    Historical rows can be retained for auditing and rate comparisons.
-
-    This table stores market-rate observations, not customer quotes or
-    executed FX trades.
-    """
-
-    __tablename__ = "exchange_rates"
-
-    id = Column(Integer, primary_key=True, index=True)
-    base_currency = Column(String, nullable=False, index=True)
-    quote_currency = Column(String, nullable=False, index=True)
-    rate = Column(Numeric(precision=18, scale=6), nullable=False)
-    fetched_at = Column(DateTime, server_default=func.now(), nullable=False)
