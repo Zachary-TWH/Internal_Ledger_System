@@ -92,6 +92,9 @@ class Transaction(Base):
     notes = Column(String, nullable=True)
     exchange_rate_used = Column(Numeric(precision=18, scale=6), nullable=True)
 
+    # The CHECK constraint below enforces that only a REVERSAL transaction has a reversal_of value, and every REVERSAL 
+    # transaction has one. This prevents data inconsistencies where a non-REVERSAL transaction could have a 
+    # reversal_of value or a REVERSAL transaction could lack one.
     __table_args__ = (
         CheckConstraint(
             "(type = 'REVERSAL' AND reversal_of IS NOT NULL) "
@@ -126,6 +129,8 @@ class LedgerEntry(Base):
     entry_type = Column(Enum(EntryType), nullable=False)
     amount = Column(Numeric(precision=18, scale=2), nullable=False)
 
+    # The CHECK constraint below enforces that the amount is always positive. This prevents data inconsistencies where a ledger entry 
+    # could have a non-positive amount, which would violate the expected behavior of financial postings.
     __table_args__ = (
         CheckConstraint("amount > 0", name="ck_ledger_entry_positive_amount"),
     )
