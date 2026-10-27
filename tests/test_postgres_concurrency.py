@@ -13,6 +13,7 @@ Without TEST_POSTGRES_URL the whole file is skipped.
 """
 
 import os
+from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 
@@ -38,12 +39,14 @@ if engine.dialect.name != "postgresql":
 
 @pytest.fixture(autouse=True)
 def fresh_db(monkeypatch):
-    """Empty tables, then the EXTERNAL system accounts. The live FX rate is faked at USD -> SGD 1.35."""
+    """Empty tables, then the four system accounts (EXTERNAL and FX_POSITION for USD and SGD).
+    The live FX rate is faked at 1.35 for any pair."""
     Base.metadata.drop_all(bind=engine)
     Base.metadata.create_all(bind=engine)
     db = SessionLocal()
-    for ccy in ("USD", "SGD"):
-        db.add(models.Account(owner_name="EXTERNAL", currency=ccy, balance=0, is_system=True))
+    for name in ("EXTERNAL", "FX_POSITION"):
+        for ccy in ("USD", "SGD"):
+            db.add(models.Account(owner_name=name, currency=ccy, balance=0, is_system=True))
     db.commit()
     db.close()
     # no network in tests: the transfer endpoint gets a fixed rate instead of calling Frankfurter
@@ -80,6 +83,19 @@ def transfer(src, dst, amount, key):
 
 def balance_of(account_id):
     return get(f"/accounts/{account_id}").json()["balance"]
+
+
+def system_balance(owner_name, currency):
+    """Stored balance of a system account, read straight from the database."""
+    db = SessionLocal()
+    try:
+        return db.query(models.Account).filter_by(owner_name=owner_name, currency=currency, is_system=True).one().balance
+    finally:
+        db.close()
+
+
+def month_end():
+    return get("/reconciliation/month-end?month=" + datetime.now(timezone.utc).strftime("%Y-%m")).json()
 
 
 def run_parallel(calls, workers=10):
@@ -155,6 +171,36 @@ def test_identical_simultaneous_requests_move_money_once():
     assert rows == 1
 
 
+def test_parallel_deposits_to_different_accounts_lose_no_update_on_external():
+    # every deposit also changes the one shared EXTERNAL_USD row, so this is where a lost update would show
+    accounts = [new_account(f"user{i}") for i in range(20)]
+
+    responses = run_parallel([lambda a=a, i=i: deposit(a, 10, f"d{i}") for i, a in enumerate(accounts)])
+
+    assert statuses(responses) == [200] * 20
+    assert system_balance("EXTERNAL", "USD") == Decimal("-200.00")     # 20 x 10, none lost
+    assert month_end()["status"] == "RECONCILED"
+
+
+def test_parallel_conversions_in_both_directions_do_not_deadlock_and_still_sum_to_zero():
+    alice, bob_sgd = new_account("alice"), new_account("bob", "SGD")
+    deposit(alice, 1000, "seed-a")
+    deposit(bob_sgd, 1000, "seed-b")
+
+    calls = []
+    for i in range(10):
+        calls.append(lambda i=i: transfer(alice, bob_sgd, 10.01, f"as{i}"))    # USD -> SGD
+        calls.append(lambda i=i: transfer(bob_sgd, alice, 10.01, f"sa{i}"))    # SGD -> USD
+        calls.append(lambda i=i: deposit(alice, 5, f"da{i}"))                  # USD deposits at the same time
+        calls.append(lambda i=i: withdraw(bob_sgd, 5, f"wb{i}"))               # SGD withdrawals at the same time
+    responses = run_parallel(calls)
+
+    assert statuses(responses) == [200] * 40                # none aborted by a deadlock
+    body = month_end()
+    assert body["status"] == "RECONCILED"
+    assert all(c["net"] == "0.00" for c in body["currencies"])
+
+
 # ---------------------------------------------------------------------------
 # Rounding
 # ---------------------------------------------------------------------------
@@ -175,3 +221,15 @@ def test_converted_amount_is_rounded_to_cents(amount, expected_sgd):
     credit = db.query(models.LedgerEntry).filter_by(account_id=bob_sgd).one()
     db.close()
     assert credit.amount == Decimal(expected_sgd)
+
+
+def test_month_end_sums_to_zero_after_rounded_conversions():
+    alice, bob_sgd = new_account("alice"), new_account("bob", "SGD")
+    deposit(alice, 100, "seed")
+
+    assert transfer(alice, bob_sgd, 10.01, "t1").status_code == 200     # 13.5135 rounds to 13.51
+    assert transfer(alice, bob_sgd, 0.10, "t2").status_code == 200      # 0.135 rounds to 0.14
+
+    body = month_end()
+    assert body["status"] == "RECONCILED"
+    assert system_balance("FX_POSITION", "SGD") == Decimal("-13.65")    # 13.51 + 0.14 paid out
