@@ -122,20 +122,6 @@ Balance and history reads are a good fit for caching. This is **not implemented*
 - A displayed balance can be a few seconds out of date.
 - At this scale Postgres handles the read load, so the extra moving part is not worth it yet.
 
-## Reversals (not implemented)
-
-There is no reversal endpoint. This is how I would add one.
-
-**1. A reversal is a new transaction. The original is never edited.**
-- Add `transactions.type` (`transfer`, `deposit`, `withdrawal`, `reversal`).
-- Add `transactions.reversal_of`, a nullable foreign key to the original, with a unique constraint.
-- The unique constraint is what stops a second reversal, even under concurrent requests.
-
-**2. It flips the original entries using the original stored amounts and rate.**
-- Scenario: A sends 100 USD to B at rate 1.35, so B receives 135.00 SGD. Then the rate changes to 1.40.
-- **Wrong:** reverse with today's rate. B pays back 135.00 SGD, A receives 135 / 1.40 = 96.43 USD, and A is short 3.57 USD.
-- **Correct:** reverse with the stored amounts. B pays back 135.00 SGD, A receives exactly 100.00 USD.
-
 **3. Guards.**
 - Unknown transaction: 404.
 - Already reversed: 409 (from the unique constraint).
