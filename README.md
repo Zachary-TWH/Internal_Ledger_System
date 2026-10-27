@@ -34,11 +34,13 @@ Each assumption below is a rule the ledger follows. Examples use made-up numbers
 - Month-end reconciliation proves the two still agree.
 - Entries are never edited or deleted. A mistake is fixed with a new transaction.
 
-**6. EXTERNAL accounts represent the outside world.**
-- One per currency, created at startup (`is_system = true`).
+**6. System accounts: EXTERNAL and FX_POSITION.**
+- Two kinds of system account exist, one of each per supported currency, so four in total for USD and SGD. They are created at startup (`is_system = true`).
 - Users cannot create them through the API.
-- Adding an EXTERNAL account for another currency is currently not supported. They are only created at startup for USD and SGD, so a new currency has no EXTERNAL account and deposits and withdrawals in it fail.
-- Their stored balance is not maintained. Their ledger balance is the net money that entered or left the system.
+- **EXTERNAL** represents the outside world. Deposits and withdrawals go through it.
+- **FX_POSITION** represents the bank's own currency-exchange counter. It is the account that both sides of a cross-currency conversion go through, so each currency's ledger can net to zero on its own. It is kept separate from EXTERNAL so EXTERNAL keeps one clear meaning: the net money that entered or left the system from outside.
+- Adding system accounts for another currency is currently not supported. They are only created at startup for USD and SGD, so a new currency has no EXTERNAL account and deposits and withdrawals in it fail.
+- Their stored balance is not maintained. Their ledger balance is what matters: for EXTERNAL, the net money that entered or left the system; for FX_POSITION, the net amount of that currency bought or sold through conversions.
 - Example: deposit 100 USD, then withdraw 40 USD. EXTERNAL USD ledger balance is -60.
 
 **7. Transfer amount is in the source account's currency.**
@@ -195,7 +197,7 @@ It compares each account's stored balance with its ledger entries (credits minus
 - Postgres gives both the same snapshot, so a transfer committing mid-report cannot cause a false mismatch.
 
 **5. Assumptions and limits.**
-- EXTERNAL accounts are listed as `NOT_COMPARED`. Deposits and withdrawals do not update their stored balance. Their ledger balance is the net money that entered or left the system.
+- System accounts (EXTERNAL and FX_POSITION) are listed as `NOT_COMPARED`. Deposits and withdrawals do not update their stored balance. Their ledger balance is the net money that entered or left the system.
 - `created_at` has no timezone, so month boundaries follow the database server clock.
 - Amounts are returned as 2-decimal strings, not floats, so rounding cannot hide a difference.
 - A month that has not ended can be reconciled. The response sets `month_has_ended: false`.
@@ -214,7 +216,7 @@ It compares each account's stored balance with its ledger entries (credits minus
 **7. CI/CD pipeline.**
 - File: `.github/workflows/ci.yml`. Runs on every push to `main` and every pull request.
 - **Stage 1, tests:** the endpoint tests on SQLite, then the concurrency and rounding tests against a Postgres service container. Python 3.14.
-- **Stage 2, Docker smoke test:** `docker compose up`, wait for `/docs`, create an account, deposit 100. The deposit fails if the EXTERNAL accounts were not seeded.
+- **Stage 2, Docker smoke test:** `docker compose up`, wait for `/docs`, create an account, deposit 100. The deposit fails if the system accounts were not seeded.
 - **Stage 3, deploy (simulated):** only on `main`, only after stages 1 and 2 pass. It prints what a real deploy would do. There is no real target.
 
 ## Running it
@@ -228,7 +230,8 @@ It compares each account's stored balance with its ledger entries (credits minus
 
 **3. Startup setup.**
 - On container start, `entrypoint.sh` runs `app/create_table.py` before the API starts.
-- It creates the tables and one EXTERNAL account per supported currency (USD, SGD).
+- It creates the tables and the system accounts: one EXTERNAL and one FX_POSITION account per supported currency (USD, SGD), so four in total.
+- It is safe to re-run. An account that already exists is skipped, so an older database only gets the missing ones.
 - Deposit and withdraw assume those accounts exist. If one is missing they return 500.
 
 ## Credentials
