@@ -98,6 +98,82 @@ Each assumption below is a rule the ledger follows. Examples use made-up numbers
 - Anyone who can reach the API can act on any account.
 - This is a deliberate simplification for the assignment.
 
+## Walkthrough: deposit, withdraw, transfer and reversal
+
+This follows one small story through the three tables. Account IDs assume a fresh database: 1 is EXTERNAL SGD, 2 is EXTERNAL USD, 3 is FX_POSITION SGD and 4 is FX_POSITION USD. Alice (5) and Bob (6) hold USD. Carol (7) holds SGD.
+
+**Story**
+1. Deposit 100 USD into Alice.
+2. Alice withdraws 20 USD.
+3. Alice sends 30 USD to Bob (same currency).
+4. Alice sends 40 USD to Carol at 1.35, so Carol gets 54.00 SGD (different currencies).
+5. Reverse step 4.
+
+**transactions**
+
+| id | type | reversal_of | description | rate |
+|----|------|-------------|-------------|------|
+| 1 | DEPOSIT | null | Deposit | null |
+| 2 | WITHDRAWAL | null | Withdrawal | null |
+| 3 | TRANSFER | null | Transfer | null |
+| 4 | TRANSFER | null | Transfer | 1.350000 |
+| 5 | REVERSAL | 4 | Reversal of transaction 4 | 1.350000 |
+
+**ledger_entries**
+
+| id | txn | acct | entry_type | amount | ccy* |
+|----|-----|------|------------|--------|------|
+| 1 | 1 | 2 | DEBIT | 100.00 | USD |
+| 2 | 1 | 5 | CREDIT | 100.00 | USD |
+| 3 | 2 | 5 | DEBIT | 20.00 | USD |
+| 4 | 2 | 2 | CREDIT | 20.00 | USD |
+| 5 | 3 | 5 | DEBIT | 30.00 | USD |
+| 6 | 3 | 6 | CREDIT | 30.00 | USD |
+| 7 | 4 | 5 | DEBIT | 40.00 | USD |
+| 8 | 4 | 4 | CREDIT | 40.00 | USD |
+| 9 | 4 | 3 | DEBIT | 54.00 | SGD |
+| 10 | 4 | 7 | CREDIT | 54.00 | SGD |
+| 11 | 5 | 5 | CREDIT | 40.00 | USD |
+| 12 | 5 | 4 | DEBIT | 40.00 | USD |
+| 13 | 5 | 3 | CREDIT | 54.00 | SGD |
+| 14 | 5 | 7 | DEBIT | 54.00 | SGD |
+
+*`ccy` is not a real column. It is the currency of the entry's account.
+
+**Balances after each step** (EXTERNAL SGD stays 0.00 and is left out)
+
+| after | EXT USD (2) | FX USD (4) | FX SGD (3) | Alice (5) | Bob (6) | Carol (7) |
+|-------|------|------|------|------|------|------|
+| start | 0 | 0 | 0 | 0 | 0 | 0 |
+| 1 deposit | -100 | 0 | 0 | 100 | 0 | 0 |
+| 2 withdraw | -80 | 0 | 0 | 80 | 0 | 0 |
+| 3 same-currency transfer | -80 | 0 | 0 | 50 | 30 | 0 |
+| 4 FX transfer | -80 | 40 | -54 | 10 | 30 | 54 |
+| 5 reversal | -80 | 0 | 0 | 50 | 30 | 0 |
+
+**What to notice**
+- **Deposit and withdraw:** two entries each. EXTERNAL USD mirrors the customer (-100, then -80).
+- **Same-currency transfer:** two entries, and the rate is null.
+- **FX transfer:** four entries, split by currency. USD: 40 out of Alice and into FX USD. SGD: 54 out of FX SGD and into Carol.
+- **Reversal (transaction 5):** it copies transaction 4's four entries with DEBIT and CREDIT swapped (entries 11 to 14). It uses the original 40.00 and 54.00, not today's rate.
+- **Append-only:** nothing is edited or deleted. Transaction 4 and its entries are untouched. A mistake is fixed by adding a new transaction.
+- **Each currency still nets to zero:** USD is -80 + 0 + 50 + 30 = 0. SGD is 0 + 0 + 0 = 0.
+
+**Reversal rules (`POST /transactions/{id}/reverse`)**
+
+| Request | Result | Why |
+|---------|--------|-----|
+| Reverse transaction 4 | 200 | creates transaction 5 |
+| Reverse transaction 4 again | 409 | `reversal_of = 4` already exists, and it is unique |
+| Reverse transaction 5 | 400 | its type is REVERSAL |
+| Reverse transaction 1 (the 100 USD deposit) | 400 | Alice only has 50.00, so undoing it would take her below zero |
+| Reverse transaction 99 | 404 | no such transaction |
+| Reuse an idempotency key | 409 | the key was already used |
+
+- **Why `type` and `reversal_of`:** code checks the `type` column, not the free-text description. `reversal_of` is unique, so the database itself blocks a second reversal even if two requests race. A check constraint ties the two together: only a REVERSAL has a `reversal_of`, and every REVERSAL has one.
+- **Recipient already spent the money:** the reversal is refused (400). A real system would use a dispute or compensating process, which this API does not provide.
+- **Locks:** the original transaction's row is locked, then the accounts in the usual order (customers by id, then system accounts by id), so reversals cannot deadlock with other requests.
+
 ## Caching (not implemented)
 
 Balance and history reads are a good fit for caching. This is **not implemented** to keep the ledger simple.
@@ -162,9 +238,11 @@ For each currency, all account balances (customers and system accounts) must add
 - **Endpoint tests:** `tests/test_ledger_endpoints.py`. Covers `/deposit`, `/withdraw`, `/transfer`, `GET /accounts/{id}`, the transaction history, `/fx/convert` and the reconciliation endpoint.
 - Reconciliation tests: a worked example that sums to zero in both currencies, an empty ledger, many mixed movements including rounding, a hand-changed balance flagged as `OUT_OF_BALANCE` in one currency only, offsetting errors passing (the known limit), invalid months, and `month_has_ended`.
 - System account tests: deposit and withdraw move EXTERNAL, a cross-currency transfer writes four entries and moves FX_POSITION, a same-currency transfer leaves the system accounts alone, missing system accounts return 500 and record nothing, and a customer who names an account "EXTERNAL" is never used as the system account.
+- Reversal tests: each endpoint records its transaction type, a same-currency transfer, a deposit, a withdrawal and a cross-currency transfer are reversed back exactly (the FX reversal uses the original 40.00 and 54.00 after the rate moves, with no FX lookup), the reversal's entries mirror the original with DEBIT and CREDIT swapped, nothing existing is edited or deleted, a second reversal gives 409, reversing a reversal gives 400, an unknown transaction gives 404, a reused idempotency key gives 409, a recipient who already spent the money gives 400, the history shows `type` and `reversal_of`, and the database itself rejects a second reversal and mismatched `type` / `reversal_of` values.
 - The FX service is faked in every test (the network is never called), including a failing service (503 and nothing recorded). The real fetch function is tested separately against canned responses: valid, malformed, timeout and HTTP error.
 - **Concurrency and rounding tests:** `tests/test_postgres_concurrency.py`. They need real Postgres, because SQLite ignores `SELECT ... FOR UPDATE` and does not round to 2 decimals.
-- They cover 20 parallel deposits into one account, 20 parallel deposits into different accounts (no lost update on the shared EXTERNAL row), 20 parallel withdrawals that must never overdraw, opposite-direction transfers with no deadlock, opposite-direction conversions mixed with deposits and withdrawals (no deadlock, still sums to zero), 10 identical simultaneous requests, and rounding of a converted amount (0.10 USD at 1.35 becomes 0.14 SGD, and the month-end sum stays 0.00).
+- Reversal race tests: 10 parallel reversals of one transaction give exactly one 200 and nine 409s, parallel reversals of conversions mixed with deposits do not deadlock and still sum to zero, and a reversal racing a withdrawal of the same money never leaves the recipient negative (one succeeds, one gets 400).
+- They also cover 20 parallel deposits into one account, 20 parallel deposits into different accounts (no lost update on the shared EXTERNAL row), 20 parallel withdrawals that must never overdraw, opposite-direction transfers with no deadlock, opposite-direction conversions mixed with deposits and withdrawals (no deadlock, still sums to zero), 10 identical simultaneous requests, and rounding of a converted amount (0.10 USD at 1.35 becomes 0.14 SGD, and the month-end sum stays 0.00).
 - The endpoint tests use a temporary SQLite database, so no Postgres is needed.
 - Run the endpoint tests: `pip install pytest httpx`, then `pytest tests/test_ledger_endpoints.py`.
 - Run the Postgres tests on their own, against an empty test database (its tables are dropped and recreated):
@@ -240,6 +318,7 @@ The check reads live balances, so it only says whether the books balance **now**
 - It creates the tables and the system accounts: one EXTERNAL and one FX_POSITION account per supported currency (USD, SGD), so four in total.
 - It is safe to re-run. An account that already exists is skipped, so an older database only gets the missing ones.
 - Deposit and withdraw assume the EXTERNAL accounts exist, and a cross-currency transfer assumes the FX_POSITION accounts exist. If one is missing the request returns 500 and records nothing.
+- `create_all` never alters an existing table. Transactions now have required `type` and `reversal_of` columns, so a database created before reversals needs recreating: `docker compose down -v`, then `docker compose up --build`.
 - `app/create_table.py` is the only place tables are created. The API itself does not create them. To run without Docker, run `python -m app.create_table` once before starting the API.
 
 ## Credentials

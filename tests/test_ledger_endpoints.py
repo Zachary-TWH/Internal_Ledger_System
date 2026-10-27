@@ -721,3 +721,245 @@ def test_real_fetch_reports_timeout_and_http_errors(monkeypatch):
     with pytest.raises(FxRateError) as down:
         REAL_FETCH_FX_RATE("USD", "SGD")
     assert down.value.timed_out is False
+
+
+# ---------------------------------------------------------------------------
+# Transaction type
+# ---------------------------------------------------------------------------
+
+def txn_id(response):
+    assert response.status_code == 200, response.text
+    return response.json()["transaction_id"]
+
+
+def load_txn(transaction_id):
+    db = SessionLocal()
+    try:
+        return db.query(models.Transaction).filter_by(id=transaction_id).one()
+    finally:
+        db.close()
+
+
+def entries_of(transaction_id):
+    """(account_id, entry_type, amount) for each entry of one transaction, in entry order."""
+    db = SessionLocal()
+    try:
+        rows = db.query(models.LedgerEntry).filter_by(transaction_id=transaction_id).order_by(models.LedgerEntry.id).all()
+        return [(r.account_id, r.entry_type.value, r.amount) for r in rows]
+    finally:
+        db.close()
+
+
+def test_each_endpoint_records_its_transaction_type():
+    alice, bob = new_account("alice"), new_account("bob")
+    t_dep = txn_id(post_deposit(alice, 100, "d1"))
+    t_wd = txn_id(post_withdraw(alice, 10, "w1"))
+    t_tr = txn_id(post_transfer(alice, bob, 20, "t1"))
+
+    assert load_txn(t_dep).type == models.TransactionType.DEPOSIT
+    assert load_txn(t_wd).type == models.TransactionType.WITHDRAWAL
+    assert load_txn(t_tr).type == models.TransactionType.TRANSFER
+    assert all(load_txn(t).reversal_of is None for t in (t_dep, t_wd, t_tr))
+
+
+# ---------------------------------------------------------------------------
+# POST /transactions/{id}/reverse
+# ---------------------------------------------------------------------------
+
+def post_reverse(transaction_id, key):
+    return client.post(f"/transactions/{transaction_id}/reverse", json={"idempotency_key": key})
+
+
+def test_reverse_same_currency_transfer_restores_balances():
+    alice, bob = new_account("alice"), new_account("bob")
+    deposit(alice, 100, "d1")
+    original = txn_id(post_transfer(alice, bob, 30, "t1"))
+
+    r = post_reverse(original, "r1")
+
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["reversal_of"] == original and body["transaction_id"] != original
+    assert balance_of(alice) == 100 and balance_of(bob) == 0
+    reversal = load_txn(body["transaction_id"])
+    assert reversal.type == models.TransactionType.REVERSAL and reversal.reversal_of == original
+    assert reversal.description == f"Reversal of transaction {original}"
+
+
+def test_reversal_entries_mirror_the_original_with_debit_and_credit_swapped():
+    alice, bob = new_account("alice"), new_account("bob")
+    deposit(alice, 100, "d1")
+    original = txn_id(post_transfer(alice, bob, 30, "t1"))
+
+    reversal = txn_id(post_reverse(original, "r1"))
+
+    assert entries_of(original) == [(alice, "DEBIT", Decimal("30.00")), (bob, "CREDIT", Decimal("30.00"))]
+    assert entries_of(reversal) == [(alice, "CREDIT", Decimal("30.00")), (bob, "DEBIT", Decimal("30.00"))]
+
+
+def test_reversal_never_edits_or_deletes_existing_rows():
+    alice, bob = new_account("alice"), new_account("bob")
+    deposit(alice, 100, "d1")
+    original = txn_id(post_transfer(alice, bob, 30, "t1"))
+    before = (load_txn(original).description, load_txn(original).created_at, entries_of(original))
+
+    post_reverse(original, "r1")
+
+    assert (load_txn(original).description, load_txn(original).created_at, entries_of(original)) == before
+    assert count_rows(models.Transaction) == 3        # deposit, transfer, reversal: nothing removed
+    assert count_rows(models.LedgerEntry) == 6        # 2 + 2 + 2: only added
+
+
+def test_reverse_deposit_and_withdrawal():
+    alice = new_account("alice")
+    dep = txn_id(post_deposit(alice, 100, "d1"))
+    wd = txn_id(post_withdraw(alice, 40, "w1"))
+
+    assert post_reverse(wd, "r-wd").status_code == 200
+    assert balance_of(alice) == 100 and system_balance("EXTERNAL", "USD") == Decimal("-100.00")
+
+    assert post_reverse(dep, "r-dep").status_code == 200
+    assert balance_of(alice) == 0 and system_balance("EXTERNAL", "USD") == Decimal("0.00")
+
+
+def test_reverse_cross_currency_transfer_uses_original_amounts_not_todays_rate():
+    alice, carol_sgd = new_account("alice"), new_account("carol", "SGD")
+    deposit(alice, 100, "d1")
+    original = txn_id(post_transfer(alice, carol_sgd, 40, "t1"))      # 40 USD -> 54.00 SGD at 1.35
+    assert balance_of(carol_sgd) == 54
+    FAKE_RATES[("USD", "SGD")] = Decimal("1.500000")                   # the market moves
+    FAKE_RATES[("SGD", "USD")] = Decimal("0.660000")
+    calls_before = len(FETCH_CALLS)
+
+    r = post_reverse(original, "r1")
+
+    assert r.status_code == 200, r.text
+    assert len(FETCH_CALLS) == calls_before                            # no FX lookup during a reversal
+    assert balance_of(alice) == 100 and balance_of(carol_sgd) == 0     # exactly back, not 36 or 40.5
+    for owner, ccy in (("FX_POSITION", "USD"), ("FX_POSITION", "SGD"), ("EXTERNAL", "SGD")):
+        assert system_balance(owner, ccy) == Decimal("0.00")
+    reversal = txn_id(r)
+    assert load_txn(reversal).exchange_rate_used == Decimal("1.350000")   # the original rate is copied
+    assert sorted(a for _, _, a in entries_of(reversal)) == [Decimal("40.00"), Decimal("40.00"), Decimal("54.00"), Decimal("54.00")]
+
+
+def test_reversal_of_cross_currency_transfer_keeps_every_currency_balanced():
+    alice, carol_sgd = new_account("alice"), new_account("carol", "SGD")
+    deposit(alice, 100, "d1")
+    original = txn_id(post_transfer(alice, carol_sgd, 40, "t1"))
+    post_reverse(original, "r1")
+
+    body = report().json()
+
+    assert body["status"] == "RECONCILED"
+    assert all(c["net"] == "0.00" for c in body["currencies"])
+
+
+def test_reverse_same_transaction_twice_is_rejected_and_moves_nothing():
+    alice, bob = new_account("alice"), new_account("bob")
+    deposit(alice, 100, "d1")
+    original = txn_id(post_transfer(alice, bob, 30, "t1"))
+    assert post_reverse(original, "r1").status_code == 200
+    rows_before = (count_rows(models.Transaction), count_rows(models.LedgerEntry))
+
+    second = post_reverse(original, "r2")
+
+    assert second.status_code == 409
+    assert balance_of(alice) == 100 and balance_of(bob) == 0
+    assert (count_rows(models.Transaction), count_rows(models.LedgerEntry)) == rows_before
+
+
+def test_cannot_reverse_a_reversal():
+    alice, bob = new_account("alice"), new_account("bob")
+    deposit(alice, 100, "d1")
+    reversal = txn_id(post_reverse(txn_id(post_transfer(alice, bob, 30, "t1")), "r1"))
+
+    r = post_reverse(reversal, "r2")
+
+    assert r.status_code == 400
+    assert balance_of(alice) == 100 and balance_of(bob) == 0
+
+
+def test_reverse_unknown_transaction_returns_404():
+    assert post_reverse(9999, "r1").status_code == 404
+    assert count_rows(models.Transaction) == 0
+
+
+def test_reverse_same_idempotency_key_is_rejected_and_reverses_nothing_else():
+    alice, bob = new_account("alice"), new_account("bob")
+    deposit(alice, 100, "d1")
+    first = txn_id(post_transfer(alice, bob, 10, "t1"))
+    second = txn_id(post_transfer(alice, bob, 20, "t2"))
+    assert post_reverse(first, "same-key").status_code == 200
+
+    r = post_reverse(second, "same-key")
+
+    assert r.status_code == 409
+    assert balance_of(alice) == 80 and balance_of(bob) == 20         # only the 10 transfer is undone; the 20 transfer stands
+
+
+def test_reverse_is_rejected_when_the_recipient_already_spent_the_money():
+    alice, bob = new_account("alice"), new_account("bob")
+    deposit(alice, 100, "d1")
+    original = txn_id(post_transfer(alice, bob, 30, "t1"))
+    assert post_withdraw(bob, 20, "w1").status_code == 200           # Bob now holds only 10.00
+    rows_before = (count_rows(models.Transaction), count_rows(models.LedgerEntry))
+
+    r = post_reverse(original, "r1")
+
+    assert r.status_code == 400
+    assert balance_of(alice) == 70 and balance_of(bob) == 10         # nothing changed
+    assert (count_rows(models.Transaction), count_rows(models.LedgerEntry)) == rows_before
+
+
+def test_reverse_deposit_is_rejected_when_the_money_was_spent():
+    alice = new_account("alice")
+    dep = txn_id(post_deposit(alice, 100, "d1"))
+    assert post_withdraw(alice, 60, "w1").status_code == 200
+
+    assert post_reverse(dep, "r1").status_code == 400
+    assert balance_of(alice) == 40
+
+
+def test_history_shows_type_and_reversal_link():
+    alice, bob = new_account("alice"), new_account("bob")
+    deposit(alice, 100, "d1")
+    original = txn_id(post_transfer(alice, bob, 30, "t1"))
+    reversal = txn_id(post_reverse(original, "r1"))
+
+    rows = client.get(f"/accounts/{alice}/transactions", params={"order": "asc"}).json()["results"]
+
+    assert [(r["transaction_id"], r["type"], r["reversal_of"], r["entry_type"]) for r in rows] == [
+        (1, "DEPOSIT", None, "CREDIT"),
+        (original, "TRANSFER", None, "DEBIT"),
+        (reversal, "REVERSAL", original, "CREDIT"),
+    ]
+
+
+# The database refuses bad reversal data even if the API were bypassed.
+
+def _insert_txn(**fields):
+    db = SessionLocal()
+    try:
+        db.add(models.Transaction(**fields))
+        db.commit()
+    finally:
+        db.close()
+
+
+def test_database_rejects_a_second_reversal_of_the_same_transaction():
+    alice, bob = new_account("alice"), new_account("bob")
+    deposit(alice, 100, "d1")
+    original = txn_id(post_transfer(alice, bob, 30, "t1"))
+    post_reverse(original, "r1")
+
+    with pytest.raises(Exception) as err:        # IntegrityError: reversal_of is UNIQUE
+        _insert_txn(idempotency_key="sneaky", type=models.TransactionType.REVERSAL, reversal_of=original)
+    assert "UNIQUE" in str(err.value).upper()
+
+
+def test_database_ties_reversal_of_to_the_reversal_type():
+    with pytest.raises(Exception):               # a REVERSAL must say what it reverses
+        _insert_txn(idempotency_key="k1", type=models.TransactionType.REVERSAL, reversal_of=None)
+    with pytest.raises(Exception):               # only a REVERSAL may have reversal_of
+        _insert_txn(idempotency_key="k2", type=models.TransactionType.TRANSFER, reversal_of=1)

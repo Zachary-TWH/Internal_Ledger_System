@@ -233,3 +233,67 @@ def test_month_end_sums_to_zero_after_rounded_conversions():
     body = month_end()
     assert body["status"] == "RECONCILED"
     assert system_balance("FX_POSITION", "SGD") == Decimal("-13.65")    # 13.51 + 0.14 paid out
+
+
+# ---------------------------------------------------------------------------
+# Reversals under concurrency
+# ---------------------------------------------------------------------------
+
+def reverse(transaction_id, key):
+    return post(f"/transactions/{transaction_id}/reverse", {"idempotency_key": key})
+
+
+def test_parallel_reversals_of_the_same_transaction_reverse_it_once():
+    alice, bob = new_account("alice"), new_account("bob")
+    deposit(alice, 100, "seed")
+    original = transfer(alice, bob, 30, "t1").json()["transaction_id"]
+
+    responses = run_parallel([lambda i=i: reverse(original, f"r{i}") for i in range(10)])
+
+    # Exactly one wins; the other nine are refused (the row lock plus the UNIQUE reversal_of).
+    assert statuses(responses) == [200] + [409] * 9
+    assert balance_of(alice) == 100 and balance_of(bob) == 0
+    db = SessionLocal()
+    reversals = db.query(models.Transaction).filter_by(reversal_of=original).count()
+    db.close()
+    assert reversals == 1
+    assert month_end()["status"] == "RECONCILED"
+
+
+def test_parallel_reversals_of_conversions_do_not_deadlock_and_still_sum_to_zero():
+    alice, bob_sgd = new_account("alice"), new_account("bob", "SGD")
+    deposit(alice, 1000, "seed-a")
+    deposit(bob_sgd, 1000, "seed-b")
+    originals = []
+    for i in range(5):
+        originals.append(transfer(alice, bob_sgd, 10.01, f"as{i}").json()["transaction_id"])   # USD -> SGD
+        originals.append(transfer(bob_sgd, alice, 10.01, f"sa{i}").json()["transaction_id"])   # SGD -> USD
+
+    calls = [lambda t=t: reverse(t, f"rev-{t}") for t in originals]
+    calls += [lambda i=i: deposit(alice, 5, f"da{i}") for i in range(10)]   # USD deposits at the same time
+    responses = run_parallel(calls)
+
+    assert statuses(responses) == [200] * 20                # none aborted by a deadlock
+    assert balance_of(alice) == 1050                         # 1000 back, plus 10 deposits of 5
+    assert balance_of(bob_sgd) == 1000
+    body = month_end()
+    assert body["status"] == "RECONCILED"
+    assert all(c["net"] == "0.00" for c in body["currencies"])
+    assert system_balance("FX_POSITION", "USD") == Decimal("0.00")
+    assert system_balance("FX_POSITION", "SGD") == Decimal("0.00")
+
+
+def test_reversal_and_spend_race_never_leaves_the_recipient_negative():
+    alice, bob = new_account("alice"), new_account("bob")
+    deposit(alice, 100, "seed")
+    original = transfer(alice, bob, 30, "t1").json()["transaction_id"]    # Bob holds exactly 30
+
+    responses = run_parallel([
+        lambda: reverse(original, "r1"),          # wants 30 back from Bob
+        lambda: withdraw(bob, 30, "w1"),          # Bob spends the same 30
+    ])
+
+    # One of them gets the money, the other is refused.
+    assert statuses(responses) == [200, 400]
+    assert balance_of(bob) == 0
+    assert month_end()["status"] == "RECONCILED"
