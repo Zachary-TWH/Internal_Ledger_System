@@ -367,6 +367,7 @@ def transfer(req: TransferRequest, db: Session = Depends(get_db)):
         .filter(models.Account.id.in_([req.from_account_id, req.to_account_id]))
         .all()
     )
+    # Two rows must exist, and neither can be a system account (README assumption 6)
     if len(rows) != 2:
         raise HTTPException(status_code=404, detail="Account not found")
     if any(row.is_system for row in rows):
@@ -381,6 +382,7 @@ def transfer(req: TransferRequest, db: Session = Depends(get_db)):
                 detail=f"Cross-currency transfers must be at least {MIN_CROSS_CURRENCY_AMOUNT} in the source currency",
             )
         try:
+            # _rate
             exchange_rate_used, _rate_date = fetch_fx_rate(
                 currencies[req.from_account_id], currencies[req.to_account_id]
             )
