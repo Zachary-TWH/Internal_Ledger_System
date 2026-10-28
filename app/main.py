@@ -36,7 +36,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, field_validator
 from .database import SessionLocal
@@ -737,10 +737,10 @@ def get_account(account_id: int, db: Session = Depends(get_db)):
     return account
 
 @app.get("/accounts/{account_id}/transactions")
-def get_transactions(account_id: int, db: Session = Depends(get_db), page: int = 1, page_size: int = 20, order: Literal["asc", "desc"] = "desc",):
+def get_transactions(account_id: int, db: Session = Depends(get_db), page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100), order: Literal["asc", "desc"] = "desc",):
     """Return an account's ledger entries, paginated like a bank statement.
 
-    Query params: page (starts at 1), page_size (default 20),
+    Query params: page (starts at 1), page_size (default 20, max 100),
                   order ("desc" = newest first, the default; "asc" = oldest first).
     Returns: {"page", "page_size", "order", "results": [{"transaction_id", "type",
               "reversal_of", "entry_type", "amount", "description", "created_at"}]}
@@ -748,7 +748,7 @@ def get_transactions(account_id: int, db: Session = Depends(get_db), page: int =
     transaction a REVERSAL undoes (null for every other type).
     Entries are ordered by the transaction's created_at, then by entry id,
     so the order is stable when two entries share the same timestamp and pages never overlap.
-    Errors: 404 account not found, 422 order is not "asc" or "desc"
+    Errors: 404 account not found, 422 page < 1, page_size outside 1-100, or order is not "asc" or "desc"
     """
     # check account exists first
     account = db.query(models.Account).filter_by(id=account_id).first()
