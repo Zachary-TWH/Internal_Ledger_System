@@ -41,7 +41,7 @@ Each assumption below is a rule the ledger follows. Examples use made-up numbers
 **6. System accounts: EXTERNAL and FX_POSITION.**
 - Two kinds of system account exist, one of each per supported currency, so four in total for USD and SGD. They are created at startup (`is_system = true`).
 - Users cannot create them through the API.
-- `/deposit`, `/withdraw` and `/transfer` refuse them (400) as source, destination or target account, so only the code paths that post to them can move them. `/transfer` checks this in its early read, before any FX call or row lock. Reads (`GET /accounts/{id}` and its history) stay open, so EXTERNAL and FX_POSITION balances can still be audited.
+- `/deposit`, `/withdraw` and `POST /transactions` refuse them (400) as source, destination or target account, so only the code paths that post to them can move them. `POST /transactions` checks this in its early read, before any FX call or row lock. Reads (`GET /accounts/{id}` and its history) stay open, so EXTERNAL and FX_POSITION balances can still be audited.
 - **EXTERNAL** represents the outside world. Deposits and withdrawals go through it.
 - **FX_POSITION** represents the bank's own currency-exchange counter. It is the account that both sides of a cross-currency conversion go through, so each currency's ledger can net to zero on its own. It is kept separate from EXTERNAL so EXTERNAL keeps one clear meaning: the net money that entered or left the system from outside.
 - Adding system accounts for another currency is currently not supported. They are only created at startup for USD and SGD, so a new currency has no EXTERNAL account and deposits and withdrawals in it fail.
@@ -90,6 +90,7 @@ Each assumption below is a rule the ledger follows. Examples use made-up numbers
 - This needs Postgres. SQLite ignores row locks, so concurrency is only meaningful on Postgres.
 
 **11. Idempotency keys are required on every write.**
+- `POST /transactions` is the transfer: source, destination, amount. The spec does not say how money enters the system, so `POST /deposit` and `POST /withdraw` fund and drain accounts through the EXTERNAL account.
 - Deposit, withdrawal and transfer all take an `idempotency_key`.
 - A unique constraint on the key is the final guard.
 - A reused key returns 409 and moves no money.
@@ -259,7 +260,7 @@ Two checks, both against the transaction history. The check only reports. It nev
 - **Hot rows.** See assumption 10.
 
 **5. Tests.**
-- **Endpoint tests:** `tests/test_ledger_endpoints.py`. Covers `/deposit`, `/withdraw`, `/transfer`, `GET /accounts/{id}`, the transaction history, `/fx/convert` and the reconciliation endpoint.
+- **Endpoint tests:** `tests/test_ledger_endpoints.py`. Covers `/deposit`, `/withdraw`, `POST /transactions`, `GET /accounts/{id}`, the transaction history, `/fx/convert` and the reconciliation endpoint.
 - Reconciliation tests: a worked example that sums to zero in both currencies, an empty ledger, many mixed movements including rounding, a hand-changed balance flagged as `OUT_OF_BALANCE` in one currency only, offsetting errors caught by the per-account check, the per-account stored vs ledger columns, invalid months, and `month_has_ended`.
 - System account tests: deposit and withdraw move EXTERNAL, a cross-currency transfer writes four entries and moves FX_POSITION, a same-currency transfer leaves the system accounts alone, missing system accounts return 500 and record nothing, and a customer who names an account "EXTERNAL" is never used as the system account.
 - Reversal tests: each endpoint records its transaction type, a same-currency transfer, a deposit, a withdrawal and a cross-currency transfer are reversed back exactly (the FX reversal uses the original 40.00 and 54.00 after the rate moves, with no FX lookup), the reversal's entries mirror the original with DEBIT and CREDIT swapped, nothing existing is edited or deleted, a second reversal gives 409, reversing a reversal gives 400, an unknown transaction gives 404, a reused idempotency key gives 409, a recipient who already spent the money gives 400, the history shows `type` and `reversal_of`, and the database itself rejects a second reversal and mismatched `type` / `reversal_of` values.

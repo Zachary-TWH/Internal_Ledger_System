@@ -144,6 +144,16 @@ def commit_or_409(db: Session):
         raise HTTPException(status_code=409, detail="Duplicate request")
 
 
+def reject_duplicate_key(db: Session, idempotency_key: str):
+    """Fast-path idempotency check shared by every write endpoint: a key already used gets a 409.
+
+    This runs before any lock, so two identical requests arriving together can both pass it.
+    flush_or_409 / commit_or_409 catch that race through the UNIQUE constraint.
+    """
+    if db.query(models.Transaction.id).filter_by(idempotency_key=idempotency_key).first():
+        raise HTTPException(status_code=409, detail="Duplicate request")
+
+
 def lock_system_account(db: Session, owner_name: str, currency: str) -> models.Account:
     """Load one system account (EXTERNAL or FX_POSITION) with a row lock, or fail with 500.
 
@@ -238,7 +248,7 @@ class WithdrawalRequest(BaseModel):
 
 
 class TransferRequest(BaseModel):
-    """Body of POST /transfer. `amount` is in the SOURCE account's currency."""
+    """Body of POST /transactions (a transfer). `amount` is in the SOURCE account's currency."""
     from_account_id: int
     to_account_id: int
     amount: Decimal
@@ -292,9 +302,7 @@ def deposit(req: DepositRequest, db: Session = Depends(get_db)):
       500  the EXTERNAL account has not been created
     """
     # idempotency check: has this exact request been processed before?
-    existing = db.query(models.Transaction).filter_by(idempotency_key=req.idempotency_key).first()
-    if existing:
-        raise HTTPException(status_code=409, detail="Duplicate request")
+    reject_duplicate_key(db, req.idempotency_key)
 
     # with_for_update() locks the row so no other transaction can modify it until we commit or rollback
     account = db.query(models.Account).filter_by(id=req.account_id).with_for_update().first()
@@ -358,9 +366,7 @@ def withdraw(req: WithdrawalRequest, db: Session = Depends(get_db)):
     # example values below: req.idempotency_key = "wdr-001", balance = 100, req.amount = 40
 
     # check if this exact request was already processed before
-    existing = db.query(models.Transaction).filter_by(idempotency_key=req.idempotency_key).first()
-    if existing:
-        raise HTTPException(status_code=409, detail="Duplicate request")
+    reject_duplicate_key(db, req.idempotency_key)
      
     # with_for_update() locks the row so no other transaction can modify it until we commit or rollback
     account = db.query(models.Account).filter_by(id=req.account_id).with_for_update().first()
@@ -413,7 +419,7 @@ def withdraw(req: WithdrawalRequest, db: Session = Depends(get_db)):
     return {"transaction_id": txn.id, "new_balance": money_str(account.balance)}
 
 
-@app.post("/transfer")
+@app.post("/transactions")
 def transfer(req: TransferRequest, db: Session = Depends(get_db)):
     """Move money from one account to another in a single atomic operation.
 
@@ -450,9 +456,7 @@ def transfer(req: TransferRequest, db: Session = Depends(get_db)):
       503  cross-currency transfer and the live FX rate is unavailable (nothing is recorded)
     """
     # check if this exact transfer was already processed before
-    existing = db.query(models.Transaction).filter_by(idempotency_key=req.idempotency_key).first()
-    if existing:
-        raise HTTPException(status_code=409, detail="Duplicate request")
+    reject_duplicate_key(db, req.idempotency_key)
 
     # prevent transferring to yourself
     if req.from_account_id == req.to_account_id:
@@ -498,11 +502,10 @@ def transfer(req: TransferRequest, db: Session = Depends(get_db)):
     lock_second_id = max(req.from_account_id, req.to_account_id)
 
     # load both accounts with row locks (SELECT ... FOR UPDATE)
+    # Both rows exist: the early read above already returned 404 for a missing account, and
+    # accounts are never deleted, so no second "not found" check is needed here.
     first = db.query(models.Account).filter_by(id=lock_first_id).with_for_update().first()
     second = db.query(models.Account).filter_by(id=lock_second_id).with_for_update().first()
-
-    if not first or not second:
-        raise HTTPException(status_code=404, detail="Account not found")
 
     # map the locked rows back to source and destination
     from_account = first if first.id == req.from_account_id else second
@@ -619,9 +622,7 @@ def reverse_transaction(transaction_id: int, req: ReversalRequest, db: Session =
            a compensating transfer), which this API does not provide.
     """
     # check if this exact request was already processed before
-    existing = db.query(models.Transaction).filter_by(idempotency_key=req.idempotency_key).first()
-    if existing:
-        raise HTTPException(status_code=409, detail="Duplicate request")
+    reject_duplicate_key(db, req.idempotency_key)
 
     # Lock the original transaction's row so two reversals of it run one at a time. Nothing else
     # locks a transaction row, so this cannot deadlock with the account locks taken below.
@@ -810,7 +811,7 @@ def fx_convert(from_currency: str, to_currency: str, amount: Decimal = Decimal("
     Query params: from_currency (e.g. USD), to_currency (e.g. SGD), amount (default 1).
     Example: GET /fx/convert?from_currency=USD&to_currency=SGD&amount=100
 
-    Read-only quote tool: it does not touch any account or the ledger. Nothing is stored; /transfer
+    Read-only quote tool: it does not touch any account or the ledger. Nothing is stored; POST /transactions
     fetches its own live rate at execution time and saves only the rate it actually used.
     The rate is parsed as a Decimal (never float) and the result is rounded to 2 decimal places.
 
