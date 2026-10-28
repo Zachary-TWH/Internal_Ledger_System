@@ -236,12 +236,10 @@ Use `GET /reconciliation/month-end?month=YYYY-MM`. The response includes monthly
 CI (`.github/workflows/ci.yml`) runs both test suites on pushes to `main`, pull requests, or manual dispatch, then builds the Docker Compose stack and performs an API smoke test. The deploy job is simulated and does not deploy anywhere.
 
 
-## Credentials
+## Local configuration
 
-**1. Demo password only.**
-- `POSTGRES_PASSWORD` comes from the committed `.env` (`mysecret`).
-- It is a demo credential for local use, so the project runs with no setup.
+Copy `.env.example` to `.env` and replace the placeholder password with a local-only value. Keep `.env` untracked; it is ignored by Git. Run `docker compose up --build` from the repository root to start the database and API. Docker Compose requires `POSTGRES_PASSWORD` to be set and passes the database URL to the API.
 
-**2. Why `.env` is committed.**
-- It holds no real secret. It is committed on purpose for this assignment.
-- A real deployment would inject secrets from a secrets manager and never commit them.
+For a local app process outside Docker, set `DATABASE_URL` to a PostgreSQL connection URL in `.env` or the environment. The example uses the same password for both variables; if you change it, keep them in sync. Use a URL-safe password or percent-encode special characters in the connection URL.
+
+These credentials are for local development only. A real deployment should inject secrets through its platform or a secrets manager, not commit them to source control.
