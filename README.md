@@ -282,32 +282,6 @@ Two checks, both against the transaction history. The check only reports. It nev
 - **Stage 3, deploy (simulated):** only on `main`, only after stages 1 and 2 pass. It prints what a real deploy would do. There is no real target.
 
 
-## Monthly balance snapshots (not implemented)
-
-The check reads live balances, so it only says whether the books balance **now**. It cannot reconcile a past month, and no month-end figures are kept. A snapshot saved at each month-end fixes both. This is **not implemented**.
-
-**1. The design.**
-- A new table `account_snapshots` with: `account_id`, `month`, `closing_balance`, `last_entry_id`, `taken_at`. One row per account per month, unique on (`account_id`, `month`).
-- A scheduled job writes the table straight after the month-end check reports `RECONCILED`.
-- `last_entry_id` is the highest ledger entry included, so the cut-off is exact instead of relying on `created_at`, which follows the database server clock and has no timezone.
-- Snapshots are write-once. If one looks wrong, that is a reconciliation problem to investigate, not something to overwrite.
-
-**2. What it enables.**
-- Reconcile any past month: add up that month's snapshots per currency. The sum must be 0.00.
-- A saved closing balance per account per month, to compare with a statement.
-- A period can be marked closed once its snapshots exist.
-
-**3. Trade-offs.**
-- One more table and a job that must run reliably. A missed month means no snapshot for it, not a wrong answer elsewhere.
-- The job must read one consistent view of all balances, as the report does now with a single SQL statement.
-
-**4. How I would test it.**
-- Post entries across two months, snapshot the first, change balances in the second. The first month's sum must stay 0.00.
-- Change a snapshot row by hand. Expect the sum for that month to fail.
-- Run the job twice for the same month. Expect no duplicate rows (unique constraint).
-
-
-
 ## Credentials
 
 **1. Demo password only.**
