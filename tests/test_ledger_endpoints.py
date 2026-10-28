@@ -1,7 +1,7 @@
 """Endpoint tests for the ledger API.
 
-Covers POST /deposit, POST /withdraw, POST /transfer, GET /accounts/{id},
-GET /accounts/{id}/transactions, GET /fx/convert and GET /reconciliation/month-end.
+Covers POST /deposit, POST /withdraw, POST /transactions, GET /accounts/{id},
+GET /accounts/{id}/transactions and GET /reconciliation/month-end.
 Concurrency and rounding are tested in test_postgres_concurrency.py, because SQLite
 ignores SELECT ... FOR UPDATE and does not round to the column's 2 decimal places.
 
@@ -76,7 +76,7 @@ def deposit(account_id, amount, key):
 
 
 def transfer(src, dst, amount, key):
-    r = client.post("/transfer", json={"from_account_id": src, "to_account_id": dst, "amount": amount, "idempotency_key": key})
+    r = client.post("/transactions", json={"from_account_id": src, "to_account_id": dst, "amount": amount, "idempotency_key": key})
     assert r.status_code == 200, r.text
 
 
@@ -109,7 +109,7 @@ def post_withdraw(account_id, amount, key):
 
 
 def post_transfer(src, dst, amount, key):
-    return client.post("/transfer", json={"from_account_id": src, "to_account_id": dst, "amount": amount, "idempotency_key": key})
+    return client.post("/transactions", json={"from_account_id": src, "to_account_id": dst, "amount": amount, "idempotency_key": key})
 
 
 def balance_of(account_id):
@@ -477,7 +477,7 @@ def test_withdraw_rejects_zero_and_negative_amount(bad_amount):
 
 
 # ---------------------------------------------------------------------------
-# POST /transfer
+# POST /transactions
 # ---------------------------------------------------------------------------
 
 def test_transfer_same_currency_updates_both_balances_and_writes_two_entries():
@@ -800,41 +800,8 @@ def test_history_invalid_order_returns_422():
 
 
 # ---------------------------------------------------------------------------
-# GET /fx/convert and the real fetch_fx_rate (the network is faked, never called)
+# The real fetch_fx_rate (the network is faked, never called)
 # ---------------------------------------------------------------------------
-
-def test_fx_convert_returns_rate_and_rounded_amount():
-    FAKE_RATES[("USD", "SGD")] = Decimal("1.291234")
-
-    r = client.get("/fx/convert", params={"from_currency": "usd", "to_currency": "SGD", "amount": "10.01"})
-
-    assert r.status_code == 200
-    body = r.json()
-    assert body["rate"] == "1.291234" and body["converted_amount"] == "12.93"   # 12.92... rounds up
-    assert body["from_currency"] == "USD" and body["rate_date"] == "2026-10-27"
-
-
-def test_fx_convert_same_currency_needs_no_lookup():
-    r = client.get("/fx/convert", params={"from_currency": "USD", "to_currency": "USD", "amount": "5"})
-
-    assert r.status_code == 200 and r.json()["converted_amount"] == "5.00"
-    assert FETCH_CALLS == []
-
-
-@pytest.mark.parametrize("params", [
-    {"from_currency": "EUR", "to_currency": "SGD", "amount": "1"},     # unsupported currency
-    {"from_currency": "USD", "to_currency": "SGD", "amount": "0"},     # not positive
-])
-def test_fx_convert_rejects_bad_input(params):
-    assert client.get("/fx/convert", params=params).status_code == 400
-
-
-def test_fx_convert_returns_503_when_service_is_down():
-    FAKE_RATES.clear()
-
-    r = client.get("/fx/convert", params={"from_currency": "USD", "to_currency": "SGD"})
-
-    assert r.status_code == 503
 
 
 class _FakeResponse:
@@ -1138,4 +1105,3 @@ def test_database_ties_reversal_of_to_the_reversal_type():
         _insert_txn(idempotency_key="k1", type=models.TransactionType.REVERSAL, reversal_of=None)
     with pytest.raises(Exception):               # only a REVERSAL may have reversal_of
         _insert_txn(idempotency_key="k2", type=models.TransactionType.TRANSFER, reversal_of=1)
-

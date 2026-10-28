@@ -78,7 +78,7 @@ def withdraw(account_id, amount, key):
 
 
 def transfer(src, dst, amount, key):
-    return post("/transfer", {"from_account_id": src, "to_account_id": dst, "amount": amount, "idempotency_key": key})
+    return post("/transactions", {"from_account_id": src, "to_account_id": dst, "amount": amount, "idempotency_key": key})
 
 
 def balance_of(account_id):
