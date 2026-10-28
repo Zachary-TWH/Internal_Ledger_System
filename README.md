@@ -91,6 +91,7 @@ Each assumption below is a rule the ledger follows. Examples use made-up numbers
 
 **11. Idempotency keys are required on every write.**
 - Deposit, withdrawal and transfer all take an `idempotency_key`.
+- `POST /transactions` takes all three in one endpoint: the `type` field (`DEPOSIT`, `WITHDRAWAL` or `TRANSFER`) picks the operation, the key is checked once, and the request goes to that type's handler. A body that does not match its type (for example a `TRANSFER` with no `to_account_id`) is rejected with 422. `/deposit`, `/withdraw` and `/transfer` still work and call the same handlers.
 - A unique constraint on the key is the final guard.
 - A reused key returns 409 and moves no money.
 - Example: a client retries `transfer-001` after a timeout. The second call is rejected, so the money moves once.

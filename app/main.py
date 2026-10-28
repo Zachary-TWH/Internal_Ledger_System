@@ -38,14 +38,14 @@ import urllib.request
 
 from fastapi import FastAPI, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 from .database import SessionLocal
 from . import models
 from decimal import Decimal, ROUND_HALF_UP
 from datetime import datetime, timezone
 from sqlalchemy import func, case, and_
 from sqlalchemy.exc import IntegrityError
-from typing import Literal
+from typing import Annotated, Literal, Union
 
 
 SUPPORTED_CURRENCIES = ["USD", "SGD"]
@@ -141,6 +141,16 @@ def commit_or_409(db: Session):
         db.commit()
     except IntegrityError:
         db.rollback()
+        raise HTTPException(status_code=409, detail="Duplicate request")
+
+
+def reject_duplicate_key(db: Session, idempotency_key: str):
+    """Fast-path idempotency check shared by every write endpoint: a key already used gets a 409.
+
+    This runs before any lock, so two identical requests arriving together can both pass it.
+    flush_or_409 / commit_or_409 catch that race through the UNIQUE constraint.
+    """
+    if db.query(models.Transaction.id).filter_by(idempotency_key=idempotency_key).first():
         raise HTTPException(status_code=409, detail="Duplicate request")
 
 
@@ -255,6 +265,29 @@ class ReversalRequest(BaseModel):
     idempotency_key: str
 
 
+class DepositTransaction(DepositRequest):
+    """POST /transactions body with type DEPOSIT (same fields as POST /deposit)."""
+    type: Literal["DEPOSIT"]
+
+
+class WithdrawalTransaction(WithdrawalRequest):
+    """POST /transactions body with type WITHDRAWAL (same fields as POST /withdraw)."""
+    type: Literal["WITHDRAWAL"]
+
+
+class TransferTransaction(TransferRequest):
+    """POST /transactions body with type TRANSFER (same fields as POST /transfer)."""
+    type: Literal["TRANSFER"]
+
+
+# Pydantic reads `type` first and then validates the body against that type's model only, so a
+# TRANSFER with no to_account_id is rejected with 422 naming the missing field, before any code runs.
+TransactionRequest = Annotated[
+    Union[DepositTransaction, WithdrawalTransaction, TransferTransaction],
+    Field(discriminator="type"),
+]
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -276,8 +309,7 @@ def create_account(account: AccountCreate, db: Session = Depends(get_db)):
     return new_account
 
 
-@app.post("/deposit")
-def deposit(req: DepositRequest, db: Session = Depends(get_db)):
+def handle_deposit(req: DepositRequest, db: Session):
     """Add money to an account (money comes in from EXTERNAL).
 
     Ledger entries: DEBIT EXTERNAL, CREDIT the user's account.
@@ -291,11 +323,6 @@ def deposit(req: DepositRequest, db: Session = Depends(get_db)):
       400  the account is a system account (EXTERNAL or FX_POSITION), which customers cannot use
       500  the EXTERNAL account has not been created
     """
-    # idempotency check: has this exact request been processed before?
-    existing = db.query(models.Transaction).filter_by(idempotency_key=req.idempotency_key).first()
-    if existing:
-        raise HTTPException(status_code=409, detail="Duplicate request")
-
     # with_for_update() locks the row so no other transaction can modify it until we commit or rollback
     account = db.query(models.Account).filter_by(id=req.account_id).with_for_update().first()
     if not account:
@@ -340,8 +367,7 @@ def deposit(req: DepositRequest, db: Session = Depends(get_db)):
     return {"transaction_id": txn.id, "new_balance": money_str(account.balance)}
 
 
-@app.post("/withdraw")
-def withdraw(req: WithdrawalRequest, db: Session = Depends(get_db)):
+def handle_withdraw(req: WithdrawalRequest, db: Session):
     """Take money out of an account (money goes out to EXTERNAL).
 
     Ledger entries: DEBIT the user's account, CREDIT EXTERNAL.
@@ -357,11 +383,6 @@ def withdraw(req: WithdrawalRequest, db: Session = Depends(get_db)):
     """
     # example values below: req.idempotency_key = "wdr-001", balance = 100, req.amount = 40
 
-    # check if this exact request was already processed before
-    existing = db.query(models.Transaction).filter_by(idempotency_key=req.idempotency_key).first()
-    if existing:
-        raise HTTPException(status_code=409, detail="Duplicate request")
-     
     # with_for_update() locks the row so no other transaction can modify it until we commit or rollback
     account = db.query(models.Account).filter_by(id=req.account_id).with_for_update().first()
     if not account:
@@ -413,8 +434,7 @@ def withdraw(req: WithdrawalRequest, db: Session = Depends(get_db)):
     return {"transaction_id": txn.id, "new_balance": money_str(account.balance)}
 
 
-@app.post("/transfer")
-def transfer(req: TransferRequest, db: Session = Depends(get_db)):
+def handle_transfer(req: TransferRequest, db: Session):
     """Move money from one account to another in a single atomic operation.
 
     `amount` is in the source account's currency. If the two accounts use different
@@ -449,11 +469,6 @@ def transfer(req: TransferRequest, db: Session = Depends(get_db)):
       400  insufficient funds in the source account
       503  cross-currency transfer and the live FX rate is unavailable (nothing is recorded)
     """
-    # check if this exact transfer was already processed before
-    existing = db.query(models.Transaction).filter_by(idempotency_key=req.idempotency_key).first()
-    if existing:
-        raise HTTPException(status_code=409, detail="Duplicate request")
-
     # prevent transferring to yourself
     if req.from_account_id == req.to_account_id:
         raise HTTPException(status_code=400, detail="Cannot transfer to the same account")
@@ -590,6 +605,57 @@ def transfer(req: TransferRequest, db: Session = Depends(get_db)):
     }
 
 
+TRANSACTION_HANDLERS = {
+    "DEPOSIT": handle_deposit,
+    "WITHDRAWAL": handle_withdraw,
+    "TRANSFER": handle_transfer,
+}
+
+
+@app.post("/transactions")
+def create_transaction(req: TransactionRequest, db: Session = Depends(get_db)):
+    """Post a deposit, withdrawal or transfer through one endpoint. `type` picks the operation.
+
+    Bodies (all amounts are strings or numbers with at most 2 decimal places):
+      {"type": "DEPOSIT",    "account_id": 5, "amount": "100.00", "idempotency_key": "k1"}
+      {"type": "WITHDRAWAL", "account_id": 5, "amount": "40.00",  "idempotency_key": "k2"}
+      {"type": "TRANSFER",   "from_account_id": 5, "to_account_id": 6, "amount": "25.00",
+                             "idempotency_key": "k3"}
+
+    The idempotency key is checked once here, then the request goes to the handler for its type.
+    Each handler does exactly what its own endpoint does (same locks, checks, ledger entries and
+    errors), see POST /deposit, POST /withdraw and POST /transfer.
+
+    Returns the same body as the matching endpoint:
+      DEPOSIT, WITHDRAWAL: {"transaction_id", "new_balance"}
+      TRANSFER: {"transaction_id", "exchange_rate_used", "from_account_new_balance", "to_account_new_balance"}
+    Errors: 422 unknown `type` or a missing/invalid field for that type, plus the errors of the handler.
+    """
+    reject_duplicate_key(db, req.idempotency_key)
+    return TRANSACTION_HANDLERS[req.type](req, db)
+
+
+@app.post("/deposit")
+def deposit(req: DepositRequest, db: Session = Depends(get_db)):
+    """Same as POST /transactions with type DEPOSIT. See handle_deposit for the rules and errors."""
+    reject_duplicate_key(db, req.idempotency_key)
+    return handle_deposit(req, db)
+
+
+@app.post("/withdraw")
+def withdraw(req: WithdrawalRequest, db: Session = Depends(get_db)):
+    """Same as POST /transactions with type WITHDRAWAL. See handle_withdraw for the rules and errors."""
+    reject_duplicate_key(db, req.idempotency_key)
+    return handle_withdraw(req, db)
+
+
+@app.post("/transfer")
+def transfer(req: TransferRequest, db: Session = Depends(get_db)):
+    """Same as POST /transactions with type TRANSFER. See handle_transfer for the rules and errors."""
+    reject_duplicate_key(db, req.idempotency_key)
+    return handle_transfer(req, db)
+
+
 @app.post("/transactions/{transaction_id}/reverse")
 def reverse_transaction(transaction_id: int, req: ReversalRequest, db: Session = Depends(get_db)):
     """Undo a transaction by posting a new REVERSAL transaction. Nothing is edited or deleted.
@@ -618,10 +684,7 @@ def reverse_transaction(transaction_id: int, req: ReversalRequest, db: Session =
            recipient already spent it). Reversing then needs a separate process (a dispute or
            a compensating transfer), which this API does not provide.
     """
-    # check if this exact request was already processed before
-    existing = db.query(models.Transaction).filter_by(idempotency_key=req.idempotency_key).first()
-    if existing:
-        raise HTTPException(status_code=409, detail="Duplicate request")
+    reject_duplicate_key(db, req.idempotency_key)
 
     # Lock the original transaction's row so two reversals of it run one at a time. Nothing else
     # locks a transaction row, so this cannot deadlock with the account locks taken below.
