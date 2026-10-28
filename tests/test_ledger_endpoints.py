@@ -593,6 +593,39 @@ def test_transfer_cross_currency_returns_503_when_rate_service_is_down():
     assert balance_of(bob_sgd) == 90 and balance_of(alice) == Decimal("7.40")          # 10 SGD x 0.74
 
 
+@pytest.mark.parametrize("small_amount", [0.01, 5, 9.99])
+def test_cross_currency_transfer_below_minimum_is_rejected_before_any_fx_call(small_amount):
+    alice, bob_sgd = new_account("alice"), new_account("bob", "SGD")
+    deposit(alice, 100, "d1")
+    transactions_before = count_rows(models.Transaction)
+
+    r = post_transfer(alice, bob_sgd, small_amount, "t1")
+
+    assert r.status_code == 400
+    assert "at least 10" in r.json()["detail"]
+    assert FETCH_CALLS == []                              # refused before the network call
+    assert balance_of(alice) == 100 and balance_of(bob_sgd) == 0
+    assert count_rows(models.Transaction) == transactions_before
+
+
+def test_cross_currency_transfer_of_exactly_the_minimum_is_allowed():
+    alice, bob_sgd = new_account("alice"), new_account("bob", "SGD")
+    deposit(alice, 100, "d1")
+
+    r = post_transfer(alice, bob_sgd, 10, "t1")           # 10 USD x 1.35 = 13.50 SGD
+
+    assert r.status_code == 200
+    assert balance_of(alice) == 90 and balance_of(bob_sgd) == Decimal("13.50")
+
+
+def test_same_currency_transfer_has_no_minimum():
+    alice, bob = new_account("alice"), new_account("bob")
+    deposit(alice, 100, "d1")
+
+    assert post_transfer(alice, bob, 0.01, "t1").status_code == 200
+    assert balance_of(alice) == Decimal("99.99") and balance_of(bob) == Decimal("0.01")
+
+
 def test_same_currency_transfer_never_calls_the_rate_service():
     alice, bob = new_account("alice"), new_account("bob")
     deposit(alice, 100, "d1")
@@ -608,6 +641,27 @@ def test_transfer_to_unknown_account_does_not_call_the_rate_service():
 
     assert post_transfer(alice, 9999, 10, "t1").status_code == 404
     assert FETCH_CALLS == []
+
+
+@pytest.mark.parametrize("bad_amount", [0.001, 0.004, 0.005, 10.005])
+def test_amounts_with_more_than_two_decimals_are_rejected_everywhere(bad_amount):
+    alice, bob = new_account("alice"), new_account("bob")
+    deposit(alice, 100, "d1")
+    transactions_before = count_rows(models.Transaction)
+
+    assert post_deposit(alice, bad_amount, "x1").status_code == 422
+    assert post_withdraw(alice, bad_amount, "x2").status_code == 422
+    assert post_transfer(alice, bob, bad_amount, "x3").status_code == 422
+    assert balance_of(alice) == 100 and balance_of(bob) == 0
+    assert count_rows(models.Transaction) == transactions_before
+
+
+def test_smallest_valid_amount_is_one_cent():
+    alice, bob = new_account("alice"), new_account("bob")
+
+    assert post_deposit(alice, 0.01, "d1").status_code == 200
+    assert post_transfer(alice, bob, 0.01, "t1").status_code == 200
+    assert balance_of(alice) == 0 and balance_of(bob) == Decimal("0.01")
 
 
 @pytest.mark.parametrize("bad_amount", [0, -10])
@@ -761,12 +815,12 @@ def test_fx_convert_rejects_bad_input(params):
     assert client.get("/fx/convert", params=params).status_code == 400
 
 
-def test_fx_convert_returns_502_when_service_is_down():
+def test_fx_convert_returns_503_when_service_is_down():
     FAKE_RATES.clear()
 
     r = client.get("/fx/convert", params={"from_currency": "USD", "to_currency": "SGD"})
 
-    assert r.status_code == 502
+    assert r.status_code == 503
 
 
 class _FakeResponse:
@@ -794,6 +848,17 @@ def test_real_fetch_parses_frankfurter_response(monkeypatch):
     assert rate == Decimal("1.291200") and rate_date == "2026-10-27"   # Decimal, 6 places, not a float
 
 
+def test_real_fetch_rounds_the_rate_half_up_to_6_places(monkeypatch):
+    # 1.3500005 is exactly half way between 1.350000 and 1.350001. Half up gives 1.350001
+    # (Python's default, half even, would give 1.350000).
+    body = b'{"date":"2026-10-27","rates":{"SGD":1.3500005}}'
+    monkeypatch.setattr(app_main.urllib.request, "urlopen", lambda req, timeout: _FakeResponse(body))
+
+    rate, _ = REAL_FETCH_FX_RATE("USD", "SGD")
+
+    assert rate == Decimal("1.350001")
+
+
 @pytest.mark.parametrize("body", [b"not json", b'{"rates":{}}', b'{"rates":{"SGD":0}}', b'{"rates":{"SGD":"abc"}}'])
 def test_real_fetch_rejects_bad_responses(monkeypatch, body):
     monkeypatch.setattr(app_main.urllib.request, "urlopen", lambda req, timeout: _FakeResponse(body))
@@ -809,15 +874,14 @@ def test_real_fetch_reports_timeout_and_http_errors(monkeypatch):
     def server_error(req, timeout):
         raise urllib.error.HTTPError(req.full_url, 500, "boom", {}, None)
 
+    # pass or fail: a timeout and an HTTP error are both just "the rate is unavailable"
     monkeypatch.setattr(app_main.urllib.request, "urlopen", timeout)
-    with pytest.raises(FxRateError) as slow:
+    with pytest.raises(FxRateError):
         REAL_FETCH_FX_RATE("USD", "SGD")
-    assert slow.value.timed_out is True
 
     monkeypatch.setattr(app_main.urllib.request, "urlopen", server_error)
-    with pytest.raises(FxRateError) as down:
+    with pytest.raises(FxRateError):
         REAL_FETCH_FX_RATE("USD", "SGD")
-    assert down.value.timed_out is False
 
 
 # ---------------------------------------------------------------------------

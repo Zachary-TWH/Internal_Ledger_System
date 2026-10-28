@@ -50,6 +50,12 @@ from typing import Literal
 
 SUPPORTED_CURRENCIES = ["USD", "SGD"]
 
+# A cross-currency transfer must be at least this much, in the SOURCE account's currency.
+# The destination amount is rounded to 2 decimals, so a tiny amount at a low rate could round
+# to 0.00 and fail the ledger's "amount > 0" rule. A minimum of 10 keeps the converted amount
+# positive for any rate above 0.0005.
+MIN_CROSS_CURRENCY_AMOUNT = Decimal("10")
+
 # Free, no-API-key FX rate service (European Central Bank reference rates, updated on working days)
 FRANKFURTER_URL = "https://api.frankfurter.dev/v1/latest"
 FX_TIMEOUT_SECONDS = 5
@@ -66,7 +72,7 @@ class FxRateError(Exception):
 def fetch_fx_rate(from_currency: str, to_currency: str):
     """Fetch the live rate (1 from_currency = rate to_currency) from Frankfurter.
 
-    Returns (rate, rate_date). The rate is a Decimal rounded to 6 places, the scale of
+    Returns (rate, rate_date). The rate is a Decimal rounded to 6 places (half up), the scale of
     transactions.exchange_rate_used, so the rate we use is exactly the rate we store.
     Raises FxRateError on any network, HTTP or response-format problem. Never returns a
     guessed or cached rate: if the service cannot be reached, the caller must refuse the request.
@@ -78,7 +84,7 @@ def fetch_fx_rate(from_currency: str, to_currency: str):
         with urllib.request.urlopen(request, timeout=FX_TIMEOUT_SECONDS) as response:
             # parse_float=Decimal keeps the rate exact instead of turning it into a float
             payload = json.loads(response.read().decode("utf-8"), parse_float=Decimal)
-        rate = Decimal(str(payload["rates"][to_currency])).quantize(Decimal("0.000001"))
+        rate = Decimal(str(payload["rates"][to_currency])).quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
         rate_date = payload.get("date")
     except (urllib.error.URLError, TimeoutError, KeyError, ValueError, TypeError, ArithmeticError):
         # any failure (slow past FX_TIMEOUT_SECONDS, unreachable, HTTP error, bad response) means reject
@@ -415,6 +421,10 @@ def transfer(req: TransferRequest, db: Session = Depends(get_db)):
     in its own currency. No rates are kept in a table: only the rate actually used is saved,
     on the transaction (`exchange_rate_used`).
 
+    A cross-currency transfer must be at least MIN_CROSS_CURRENCY_AMOUNT (10) in the source
+    currency, so the rounded destination amount can never be 0.00. Same-currency transfers have no
+    such minimum.
+
     The rate is fetched BEFORE any row lock is taken, so a slow FX service never holds up
     other transfers on these accounts. If the rate cannot be fetched the transfer is refused
     (fail closed); a stale or guessed rate is never used. Same-currency transfers never call the API.
@@ -433,6 +443,7 @@ def transfer(req: TransferRequest, db: Session = Depends(get_db)):
       400  same source and destination account
       404  an account was not found
       400  either account is a system account (EXTERNAL or FX_POSITION), which customers cannot use
+      400  cross-currency transfer below the minimum (10 in the source currency)
       400  insufficient funds in the source account
       503  cross-currency transfer and the live FX rate is unavailable (nothing is recorded)
     """
@@ -465,6 +476,12 @@ def transfer(req: TransferRequest, db: Session = Depends(get_db)):
 
     exchange_rate_used = None
     if currencies[req.from_account_id] != currencies[req.to_account_id]:
+        # Too small to convert safely: refuse before the network call or any row lock.
+        if req.amount < MIN_CROSS_CURRENCY_AMOUNT:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Cross-currency transfers must be at least {MIN_CROSS_CURRENCY_AMOUNT} in the source currency",
+            )
         # Network call happens here, with no row locks held. Fail closed if it does not work.
         try:
             exchange_rate_used, _rate_date = fetch_fx_rate(

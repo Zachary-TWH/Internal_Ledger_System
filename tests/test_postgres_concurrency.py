@@ -207,7 +207,7 @@ def test_parallel_conversions_in_both_directions_do_not_deadlock_and_still_sum_t
 
 @pytest.mark.parametrize("amount, expected_sgd", [
     (10.01, "13.51"),    # 10.01 x 1.35 = 13.5135, rounds down to 13.51
-    (0.10, "0.14"),      # 0.10 x 1.35 = 0.1350, exactly half, rounds up to 0.14
+    (10.30, "13.91"),    # 10.30 x 1.35 = 13.905, exactly half, rounds up to 13.91 (half even would give 13.90)
 ])
 def test_converted_amount_is_rounded_to_cents(amount, expected_sgd):
     alice, bob_sgd = new_account("alice"), new_account("bob", "SGD")
@@ -228,11 +228,11 @@ def test_month_end_sums_to_zero_after_rounded_conversions():
     deposit(alice, 100, "seed")
 
     assert transfer(alice, bob_sgd, 10.01, "t1").status_code == 200     # 13.5135 rounds to 13.51
-    assert transfer(alice, bob_sgd, 0.10, "t2").status_code == 200      # 0.135 rounds to 0.14
+    assert transfer(alice, bob_sgd, 10.30, "t2").status_code == 200     # 13.905 rounds to 13.91
 
     body = month_end()
     assert body["status"] == "RECONCILED"
-    assert system_balance("FX_POSITION", "SGD") == Decimal("-13.65")    # 13.51 + 0.14 paid out
+    assert system_balance("FX_POSITION", "SGD") == Decimal("-27.42")    # 13.51 + 13.91 paid out
 
 
 # ---------------------------------------------------------------------------
