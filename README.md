@@ -59,7 +59,6 @@ Each assumption below is a rule the ledger follows. Examples use made-up numbers
 - **Fail closed.** If the rate cannot be fetched (timeout after 5 seconds, error, malformed or non-positive rate), the cross-currency transfer is rejected with 503 and nothing is recorded. A stale or guessed rate is never used. Same-currency transfers, deposits and withdrawals keep working. Because nothing was recorded, the client can retry with the same idempotency key.
 - **The rate is fetched before any row lock is taken** (after the idempotency check). A slow or hanging FX service therefore never holds up other transfers on those accounts. The only thing read before locking is the account currencies, which never change after creation. Balances are only read after the lock.
 - Only the direct pair is used. No inverse rates, no triangulation.
-- `GET /fx/convert?from_currency=USD&to_currency=SGD&amount=100` is a read-only quote tool. It uses the same fetch and stores nothing.
 
 **Assumption about the FX source.** Frankfurter publishes European Central Bank reference rates, updated once per working day (about 16:00 CET). The service is up around the clock, but the rate is a daily reference rate, not a live market price. On weekends the last working-day rate is returned. It is free and has no uptime guarantee. This is acceptable for this assignment. A real bank would use a paid quote feed with a service-level agreement.
 
@@ -262,7 +261,7 @@ Two checks, both against the transaction history. The check only reports. It nev
 - **Hot rows.** See assumption 10.
 
 **5. Tests.**
-- **Endpoint tests:** `tests/test_ledger_endpoints.py`. Covers `/deposit`, `/withdraw`, `POST /transactions`, `GET /accounts/{id}`, the transaction history, `/fx/convert` and the reconciliation endpoint.
+- **Endpoint tests:** `tests/test_ledger_endpoints.py`. Covers `/deposit`, `/withdraw`, `POST /transactions`, `GET /accounts/{id}`, the transaction history and the reconciliation endpoint.
 - Reconciliation tests: a worked example that sums to zero in both currencies, an empty ledger, many mixed movements including rounding, a hand-changed balance flagged as `OUT_OF_BALANCE` in one currency only, offsetting errors caught by the per-account check, the per-account stored vs ledger columns, invalid months, and `month_has_ended`.
 - System account tests: deposit and withdraw move EXTERNAL, a cross-currency transfer writes four entries and moves FX_POSITION, a same-currency transfer leaves the system accounts alone, missing system accounts return 500 and record nothing, and a customer who names an account "EXTERNAL" is never used as the system account.
 - Reversal tests: each endpoint records its transaction type, a same-currency transfer, a deposit, a withdrawal and a cross-currency transfer are reversed back exactly (the FX reversal uses the original 40.00 and 54.00 after the rate moves, with no FX lookup), the reversal's entries mirror the original with DEBIT and CREDIT swapped, nothing existing is edited or deleted, a second reversal gives 409, reversing a reversal gives 400, an unknown transaction gives 404, a reused idempotency key gives 409, a recipient who already spent the money gives 400, the history shows `type` and `reversal_of`, and the database itself rejects a second reversal and mismatched `type` / `reversal_of` values.
