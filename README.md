@@ -105,6 +105,12 @@ Each assumption below is a rule the ledger follows. Examples use made-up numbers
 - Anyone who can reach the API can act on any account.
 - This is a deliberate simplification for the assignment.
 
+**14. Minimum amounts.**
+- **Same currency (deposit, withdraw, transfer): the smallest amount is 0.01.** Amounts must be greater than zero with at most 2 decimal places, so `0.001`, `0.004` and `10.005` are rejected with 422. There is no other minimum.
+- **Cross-currency transfer: the smallest amount is 10 in the source currency.** Anything lower is rejected with 400, before the FX call or any lock.
+- Why: a conversion rounds the destination amount to 2 decimals, and a tiny amount can round the wrong way. Example: 0.01 SGD at 0.74 is 0.0074 USD, which rounds up to 0.01 USD, so the recipient would get more than was sent. At the same time, a small amount at a low rate could round to 0.00 and break the ledger's `amount > 0` rule. At 10 or more, the rounding difference is a fraction of a cent and the converted amount always stays positive.
+- Example: depositing 0.01 USD works. Sending 0.01 USD to a SGD account is rejected. Sending 10 USD to a SGD account works.
+
 ## Walkthrough: deposit, withdraw, transfer and reversal
 
 This follows one small story through the three tables. Account IDs assume a fresh database: 1 is EXTERNAL SGD, 2 is EXTERNAL USD, 3 is FX_POSITION SGD and 4 is FX_POSITION USD. Alice (5) and Bob (6) hold USD. Carol (7) holds SGD.

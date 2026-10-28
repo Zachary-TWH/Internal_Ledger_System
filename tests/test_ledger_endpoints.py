@@ -608,6 +608,18 @@ def test_cross_currency_transfer_below_minimum_is_rejected_before_any_fx_call(sm
     assert count_rows(models.Transaction) == transactions_before
 
 
+def test_small_sgd_to_usd_transfer_is_rejected_too():
+    # 0.01 SGD x 0.74 = 0.0074 USD, which would round UP to 0.01 USD: more value than was sent
+    bob_sgd, alice = new_account("bob", "SGD"), new_account("alice")
+    deposit(bob_sgd, 100, "d1")
+
+    r = post_transfer(bob_sgd, alice, 0.01, "t1")
+
+    assert r.status_code == 400
+    assert FETCH_CALLS == []
+    assert balance_of(bob_sgd) == 100 and balance_of(alice) == 0
+
+
 def test_cross_currency_transfer_of_exactly_the_minimum_is_allowed():
     alice, bob_sgd = new_account("alice"), new_account("bob", "SGD")
     deposit(alice, 100, "d1")
@@ -662,6 +674,8 @@ def test_smallest_valid_amount_is_one_cent():
     assert post_deposit(alice, 0.01, "d1").status_code == 200
     assert post_transfer(alice, bob, 0.01, "t1").status_code == 200
     assert balance_of(alice) == 0 and balance_of(bob) == Decimal("0.01")
+    assert post_withdraw(bob, 0.01, "w1").status_code == 200
+    assert balance_of(bob) == 0
 
 
 @pytest.mark.parametrize("bad_amount", [0, -10])
