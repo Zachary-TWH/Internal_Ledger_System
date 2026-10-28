@@ -12,7 +12,6 @@ POST /transactions                transfer between two customer accounts (conver
 POST /transactions/{id}/reverse   undo a transaction by posting a new REVERSAL transaction
 GET  /accounts/{id}               one account and its current balance
 GET  /accounts/{id}/transactions  the account's ledger entries, paginated
-GET  /fx/convert                  read-only live FX quote (touches no account)
 GET  /reconciliation/month-end    read-only two-part reconciliation report
 
 Conventions
