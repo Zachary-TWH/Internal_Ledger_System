@@ -277,7 +277,7 @@ Two checks, both against the transaction history. The check only reports. It nev
 - Without `TEST_POSTGRES_URL`, the Postgres file is skipped.
 
 **6. CI/CD pipeline.**
-- File: `.github/workflows/ci.yml`. Runs on every push to `main` and every pull request.
+- File: `.github/workflows/ci.yml`. **Temporarily disabled:** it no longer runs on push or pull request while the code is changing, and can only be started by hand from the GitHub Actions tab. The original trigger (every push to `main` and every pull request) is kept in a comment at the top of the file, with the two fixes needed before turning it back on.
 - **Stage 1, tests:** the endpoint tests on SQLite, then the concurrency and rounding tests against a Postgres service container. Python 3.14.
 - **Stage 2, Docker smoke test:** `docker compose up`, wait for `/docs`, create an account, deposit 100. The deposit fails if the system accounts were not seeded.
 - **Stage 3, deploy (simulated):** only on `main`, only after stages 1 and 2 pass. It prints what a real deploy would do. There is no real target.
