@@ -382,7 +382,7 @@ def transfer(req: TransferRequest, db: Session = Depends(get_db)):
                 detail=f"Cross-currency transfers must be at least {MIN_CROSS_CURRENCY_AMOUNT} in the source currency",
             )
         try:
-            # _rate
+            # _rate_date is not used yet, but could be returned to the client if needed (README assumption 7)
             exchange_rate_used, _rate_date = fetch_fx_rate(
                 currencies[req.from_account_id], currencies[req.to_account_id]
             )
