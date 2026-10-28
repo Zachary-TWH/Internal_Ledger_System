@@ -513,11 +513,10 @@ def handle_transfer(req: TransferRequest, db: Session):
     lock_second_id = max(req.from_account_id, req.to_account_id)
 
     # load both accounts with row locks (SELECT ... FOR UPDATE)
+    # Both rows exist: the early read above already returned 404 for a missing account, and
+    # accounts are never deleted, so no second "not found" check is needed here.
     first = db.query(models.Account).filter_by(id=lock_first_id).with_for_update().first()
     second = db.query(models.Account).filter_by(id=lock_second_id).with_for_update().first()
-
-    if not first or not second:
-        raise HTTPException(status_code=404, detail="Account not found")
 
     # map the locked rows back to source and destination
     from_account = first if first.id == req.from_account_id else second

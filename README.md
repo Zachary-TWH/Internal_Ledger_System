@@ -47,6 +47,7 @@ Each assumption below is a rule the ledger follows. Examples use made-up numbers
 - Adding system accounts for another currency is currently not supported. They are only created at startup for USD and SGD, so a new currency has no EXTERNAL account and deposits and withdrawals in it fail.
 - Their balance is maintained like any other account's. EXTERNAL goes down on a deposit and up on a withdrawal. A positive FX_POSITION balance is the net amount of that currency the bank took in through conversions, and a negative one is the net amount it paid out.
 - Example: deposit 100 USD, then withdraw 40 USD. EXTERNAL USD balance is -60, the net money that came in from outside.
+- Known trade-off: the "account exists and is not a system account" checks are written separately in deposit, withdraw and transfer (transfer does it on an early read, before the FX call; the others after locking the row). Accounts are never deleted and `is_system` never changes, so they could be hoisted into one shared check in `POST /transactions`. That is left as a later cleanup because it touches all three handlers and changes the order of some errors.
 
 **7. Transfer amount is in the source account's currency.**
 - Same currency: destination gets the same amount. The FX service is never called.
