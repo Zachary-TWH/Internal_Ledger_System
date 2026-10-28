@@ -219,67 +219,21 @@ Balance and history reads are a good fit for caching. This is **not implemented*
 
 ## Month-end reconciliation (implemented)
 
-Two checks, both against the transaction history. The check only reports. It never edits balances, because a real error should be fixed with a new, auditable ledger transaction. Check 1 answers "accounts are reconciled against transaction history". Check 2 answers "does all the money add up".
+Reconciliation is read-only; any discrepancy should be corrected with a new, auditable transaction.
 
-**Check 1: each account against its own entries.**
-- Ledger balance = sum of the account's CREDIT entries minus the sum of its DEBIT entries.
-- It must equal the stored `accounts.balance`. `difference` is stored minus ledger, so 0.00 means reconciled.
-- Example: Alice has CREDIT 100 and DEBIT 40, so her ledger balance is 60. If her stored balance is 70, the difference is 10.00 and she is a `MISMATCH`.
-- It covers EXTERNAL and FX_POSITION too, because their balances move with every entry.
-- Each account also shows the month's `total_credits` and `total_debits`, with `opening_balance` and `closing_balance` taken from the ledger at the start and end of the month.
-- The comparison uses all entries, because the stored balance is live and has no month-end snapshot. For a past month, `closing_balance` will not equal the stored balance if later transactions exist. That is expected.
+For each account, the report compares the stored balance with credits minus debits and reports the difference. It also checks that all accounts, including the system accounts, net to zero in each currency. The report is built from one SQL statement for a consistent snapshot during live traffic.
 
-**Check 2: each currency adds up to zero.** The rest of this section describes it.
+Use `GET /reconciliation/month-end?month=YYYY-MM`. The response includes monthly activity, per-account and per-currency results, and an overall `RECONCILED` or `OUT_OF_BALANCE` status (HTTP 200 either way; invalid months return 400). The month parameter labels and groups activity, but balances are live: there are no saved historical snapshots, so this cannot reproduce a past month after later transactions. It also does not validate each transaction's entries or rate, nor compare against an external bank statement.
 
-**1. The idea.**
-- Every transaction's entries net to zero within each currency, and every account's balance (including EXTERNAL and FX_POSITION) moves with its entries. So the balances in one currency always add up to 0.00.
-- Customers' money is matched by EXTERNAL (net deposits less withdrawals, shown as a negative) and by FX_POSITION (the net amount of that currency bought or sold through conversions).
-- Example: Alice deposits 100 USD, withdraws 40, then converts 50 USD to 67.50 SGD for Bob at 1.35.
-- USD: Alice +10.00, EXTERNAL USD -60.00, FX_POSITION USD +50.00. Sum 0.00.
-- SGD: Bob +67.50, FX_POSITION SGD -67.50, EXTERNAL SGD 0.00. Sum 0.00.
-- Without the FX legs the USD sum would be -50.00 and the SGD sum +67.50, so the check could not work. That is why a conversion has four entries (see assumption 8).
+## Tests and CI
 
-**2. Endpoint.**
-- `GET /reconciliation/month-end?month=YYYY-MM`
-- It returns one row per currency (`customers_total`, `external_total`, `fx_position_total`, `net`, `status` of `OK` or `OUT_OF_BALANCE`), one row per account (check 1), a `summary` (`accounts_checked`, `accounts_mismatched`), an overall `status` of `RECONCILED` or `OUT_OF_BALANCE`, and `month_has_ended`.
-- The overall status is `OUT_OF_BALANCE` if any currency does not net to zero or any account is a `MISMATCH`.
-- Returns HTTP 200 even when out of balance. Read the `status` field. An invalid month returns 400.
-- Example, the data above: USD `net` is `0.00`, SGD `net` is `0.00`, every account is `OK`, overall `RECONCILED`. If someone sets Alice's balance to 60.00 by hand, USD `net` is `50.00`, Alice shows a `difference` of `50.00`, and the status is `OUT_OF_BALANCE`.
-- `month` labels the report. Balances are read live when the call is made, so it must be run at month-end close. In a real system a scheduled job would call the same function on the 1st of each month.
-
-**3. No false alarms from live traffic.**
-- Every balance and every ledger sum is read in one SQL statement, so Postgres gives them the same snapshot. Both checks are built from that one result. A transfer committing mid-report cannot cause a false result.
-
-**4. Known flaws of this check.**
-- **The per-currency sum says that the books are off, not where.** Check 1 names the account (a `MISMATCH` row), but a non-zero `net` on its own does not.
-- **Offsetting errors are caught by check 1.** If one account is 10 too high and another is 10 too low, the per-currency sum is still 0, but both accounts show a non-zero `difference`. A test covers this.
-- **It does not check each transaction.** It does not verify that every transaction's own entries net to zero, or that the stored rate matches the amounts. A transaction posted with unbalanced entries would also move the balances, so check 1 would still pass. This is not built.
-- **It reconciles the current moment, not a past month.** A stored balance has no history. To re-run an old month you need a saved snapshot (see below).
-- **It compares the ledger with itself.** It cannot see money that never reached the ledger, or a difference from the real bank balance. That needs an outside statement (see "How a real bank differs").
-- **A wrong rate is invisible.** Both FX legs come from the same rate, so they still balance.
-- **A database from before this change fails the check.** Old transfers have two entries across currencies, and EXTERNAL's balance was never maintained. Start from a fresh database.
-- **Hot rows.** See assumption 10.
-
-**5. Tests.**
-- **Endpoint tests:** `tests/test_ledger_endpoints.py`. Covers `/deposit`, `/withdraw`, `POST /transactions`, `GET /accounts/{id}`, the transaction history and the reconciliation endpoint.
-- Reconciliation tests: a worked example that sums to zero in both currencies, an empty ledger, many mixed movements including rounding, a hand-changed balance flagged as `OUT_OF_BALANCE` in one currency only, offsetting errors caught by the per-account check, the per-account stored vs ledger columns, invalid months, and `month_has_ended`.
-- System account tests: deposit and withdraw move EXTERNAL, a cross-currency transfer writes four entries and moves FX_POSITION, a same-currency transfer leaves the system accounts alone, missing system accounts return 500 and record nothing, and a customer who names an account "EXTERNAL" is never used as the system account.
-- Reversal tests: each endpoint records its transaction type, a same-currency transfer, a deposit, a withdrawal and a cross-currency transfer are reversed back exactly (the FX reversal uses the original 40.00 and 54.00 after the rate moves, with no FX lookup), the reversal's entries mirror the original with DEBIT and CREDIT swapped, nothing existing is edited or deleted, a second reversal gives 409, reversing a reversal gives 400, an unknown transaction gives 404, a reused idempotency key gives 409, a recipient who already spent the money gives 400, the history shows `type` and `reversal_of`, and the database itself rejects a second reversal and mismatched `type` / `reversal_of` values.
-- The FX service is faked in every test (the network is never called), including a failing service (503 and nothing recorded). The real fetch function is tested separately against canned responses: valid, malformed, timeout and HTTP error.
-- **Concurrency and rounding tests:** `tests/test_postgres_concurrency.py`. They need real Postgres, because SQLite ignores `SELECT ... FOR UPDATE` and does not round to 2 decimals.
-- Reversal race tests: 10 parallel reversals of one transaction give exactly one 200 and nine 409s, parallel reversals of conversions mixed with deposits do not deadlock and still sum to zero, and a reversal racing a withdrawal of the same money never leaves the recipient negative (one succeeds, one gets 400).
-- They also cover 20 parallel deposits into one account, 20 parallel deposits into different accounts (no lost update on the shared EXTERNAL row), 20 parallel withdrawals that must never overdraw, opposite-direction transfers with no deadlock, opposite-direction conversions mixed with deposits and withdrawals (no deadlock, still sums to zero), 10 identical simultaneous requests, and rounding of a converted amount (0.10 USD at 1.35 becomes 0.14 SGD, and the month-end sum stays 0.00).
-- The endpoint tests use a temporary SQLite database, so no Postgres is needed.
-- Run the endpoint tests: `pip install pytest httpx`, then `pytest tests/test_ledger_endpoints.py`.
+- `tests/test_ledger_endpoints.py` covers the API and business rules using a temporary SQLite database.
+- `tests/test_postgres_concurrency.py` covers locking, concurrent requests, and database rounding on PostgreSQL. SQLite cannot verify these behaviors.
+- Run the endpoint tests with `pytest tests/test_ledger_endpoints.py`.
 - Run the Postgres tests on their own, against an empty test database (its tables are dropped and recreated):
   `TEST_POSTGRES_URL=postgresql+psycopg://postgres:postgres@localhost:5432/ledger_test pytest tests/test_postgres_concurrency.py`
-- Without `TEST_POSTGRES_URL`, the Postgres file is skipped.
 
-**6. CI/CD pipeline.**
-- File: `.github/workflows/ci.yml`. **Temporarily disabled:** it no longer runs on push or pull request while the code is changing, and can only be started by hand from the GitHub Actions tab. The original trigger (every push to `main` and every pull request) is kept in a comment at the top of the file, with the two fixes needed before turning it back on.
-- **Stage 1, tests:** the endpoint tests on SQLite, then the concurrency and rounding tests against a Postgres service container. Python 3.14.
-- **Stage 2, Docker smoke test:** `docker compose up`, wait for `/docs`, create an account, deposit 100. The deposit fails if the system accounts were not seeded.
-- **Stage 3, deploy (simulated):** only on `main`, only after stages 1 and 2 pass. It prints what a real deploy would do. There is no real target.
+CI (`.github/workflows/ci.yml`) runs both test suites on pushes to `main`, pull requests, or manual dispatch, then builds the Docker Compose stack and performs an API smoke test. The deploy job is simulated and does not deploy anywhere.
 
 
 ## Credentials
@@ -291,4 +245,3 @@ Two checks, both against the transaction history. The check only reports. It nev
 **2. Why `.env` is committed.**
 - It holds no real secret. It is committed on purpose for this assignment.
 - A real deployment would inject secrets from a secrets manager and never commit them.
-
