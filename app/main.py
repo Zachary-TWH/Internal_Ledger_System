@@ -246,8 +246,6 @@ class ReversalRequest(BaseModel):
 @app.post("/accounts", response_model=AccountOut)
 def create_account(account: AccountCreate, db: Session = Depends(get_db)):
     """Create a customer account with a zero balance.
-
-    Errors: 422 unsupported currency (only USD and SGD) or a missing field
     """
     new_account = models.Account(
         owner_name=account.owner_name,
@@ -262,16 +260,7 @@ def create_account(account: AccountCreate, db: Session = Depends(get_db)):
 
 @app.post("/deposit")
 def deposit(req: DepositRequest, db: Session = Depends(get_db)):
-    """Add money to an account (DEBIT EXTERNAL, CREDIT the user).
-
-    Returns: {"transaction_id", "new_balance"}
-    Errors:
-      409  idempotency_key was already used
-      404  account not found
-      400  the account is a system account
-      422  invalid body (amount, or a missing field)
-      500  the EXTERNAL account has not been created
-    """
+    """Add money to an account (DEBIT EXTERNAL, CREDIT the user)."""
     reject_duplicate_key(db, req.idempotency_key)
 
     account = db.query(models.Account).filter_by(id=req.account_id).with_for_update().first()
@@ -314,16 +303,7 @@ def deposit(req: DepositRequest, db: Session = Depends(get_db)):
 
 @app.post("/withdraw")
 def withdraw(req: WithdrawalRequest, db: Session = Depends(get_db)):
-    """Take money out of an account (DEBIT the user, CREDIT EXTERNAL). No overdraft.
-
-    Returns: {"transaction_id", "new_balance"}
-    Errors:
-      409  idempotency_key was already used
-      404  account not found
-      400  the account is a system account, or insufficient funds
-      422  invalid body (amount, or a missing field)
-      500  the EXTERNAL account has not been created
-    """
+    """Take money out of an account (DEBIT the user, CREDIT EXTERNAL). No overdraft."""
     reject_duplicate_key(db, req.idempotency_key)
 
     account = db.query(models.Account).filter_by(id=req.account_id).with_for_update().first()
@@ -372,19 +352,9 @@ def withdraw(req: WithdrawalRequest, db: Session = Depends(get_db)):
 def transfer(req: TransferRequest, db: Session = Depends(get_db)):
     """Move money from one account to another in one atomic operation (POST /transactions).
 
-    `amount` is in the source account's currency. Cross-currency conversion, the 10 minimum and
-    the FX_POSITION entries are explained in README assumptions 7 and 8. Cheap checks run first,
-    before the FX call or any lock.
-
-    Returns: {"transaction_id", "exchange_rate_used" (null if same currency),
-              "from_account_new_balance", "to_account_new_balance"}
-    Errors:
-      409  idempotency_key was already used
-      404  an account was not found
-      400  same source and destination, a system account, insufficient funds, or a
-           cross-currency amount below the minimum
-      422  invalid body (amount, or a missing field)
-      503  cross-currency and the live FX rate is unavailable (nothing is recorded)
+    `amount` is in the source account's currency. Cross-currency conversion, the minimum and the
+    FX_POSITION entries are in README assumptions 7 and 8. Cheap checks run first, before the FX
+    call or any lock.
     """
     reject_duplicate_key(db, req.idempotency_key)
 
@@ -503,17 +473,7 @@ def transfer(req: TransferRequest, db: Session = Depends(get_db)):
 
 @app.post("/transactions/{transaction_id}/reverse")
 def reverse_transaction(transaction_id: int, req: ReversalRequest, db: Session = Depends(get_db)):
-    """Undo a transaction by posting a new REVERSAL transaction (see README "Reversal rules").
-
-    Returns: {"transaction_id", "reversal_of", "entries": [{"account_id", "entry_type", "amount"}]}
-    Errors:
-      404  transaction not found
-      409  idempotency_key was already used, or the transaction was already reversed
-      400  the transaction is itself a reversal, or a customer account no longer holds enough
-           to give the money back
-      422  the body has no idempotency_key
-      500  the original transaction has no ledger entries (should never happen)
-    """
+    """Undo a transaction by posting a new REVERSAL transaction (see README "Reversal rules")."""
     reject_duplicate_key(db, req.idempotency_key)
 
     # Lock the original transaction's row so two reversals of it run one at a time. Nothing else
@@ -614,10 +574,7 @@ def reverse_transaction(transaction_id: int, req: ReversalRequest, db: Session =
 
 @app.get("/accounts/{account_id}", response_model=AccountOut)
 def get_account(account_id: int, db: Session = Depends(get_db)):
-    """Return one account and its current balance (also works for system accounts, for auditing).
-
-    Errors: 404 account not found
-    """
+    """Return one account and its current balance (also works for system accounts, for auditing)."""
     account = db.query(models.Account).filter_by(id=account_id).first()
     if not account:
         raise HTTPException(status_code=404, detail="Account not found")
@@ -627,14 +584,9 @@ def get_account(account_id: int, db: Session = Depends(get_db)):
 def get_transactions(account_id: int, db: Session = Depends(get_db), page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100), order: Literal["asc", "desc"] = "desc",):
     """Return an account's ledger entries, paginated like a bank statement.
 
-    Query params: page (from 1), page_size (default 20, max 100), order ("desc" = newest first,
-    the default; "asc" = oldest first). Ordered by the transaction's created_at, then entry id,
-    so pages never overlap.
-    Returns: {"page", "page_size", "order", "results": [{"transaction_id", "type",
-              "reversal_of", "entry_type", "amount", "description", "created_at"}]}
+    Ordered by the transaction's created_at, then entry id ("desc" = newest first, the default).
     The list is ledger ENTRIES: a transfer shows once on each account it touches, and `amount` is
     in this account's own currency.
-    Errors: 404 account not found, 422 invalid page, page_size or order
     """
     account = db.query(models.Account).filter_by(id=account_id).first()
     if not account:
@@ -687,12 +639,7 @@ def get_transactions(account_id: int, db: Session = Depends(get_db), page: int =
 def fx_convert(from_currency: str, to_currency: str, amount: Decimal = Decimal("1")):
     """Read-only live quote between two supported currencies. Touches no account or ledger row.
 
-    Example: GET /fx/convert?from_currency=USD&to_currency=SGD&amount=100
     It does not apply the transfer minimum, so a quote can succeed for a transfer that would be refused.
-
-    Returns: {"from_currency", "to_currency", "amount", "rate", "converted_amount",
-              "rate_date", "source"}
-    Errors: 400 unsupported currency or amount not above zero, 422 amount not a number, 503 rate unavailable
     """
     from_currency = from_currency.upper()
     to_currency = to_currency.upper()
@@ -747,19 +694,9 @@ def _money(value) -> Decimal:
 def month_end_reconciliation(month: str, db: Session = Depends(get_db)):
     """Read-only month-end reconciliation. The two checks are explained in README "Month-end reconciliation".
 
-    Query param: month, "YYYY-MM". The month only shapes the opening / credits / debits / closing
-    columns. Both checks always use every entry.
-
-    Returns: {"month", "month_has_ended", "status" (RECONCILED / OUT_OF_BALANCE),
-              "summary": {"accounts_checked", "accounts_mismatched"},
-              "currencies": [{"currency", "customers_total", "external_total",
-                              "fx_position_total", "net", "status"}],
-              "accounts": [{"account_id", "owner_name", "currency", "is_system",
-                            "opening_balance", "total_credits", "total_debits", "closing_balance",
-                            "stored_balance", "ledger_balance", "difference", "status"}]}
-    Amounts are strings. `difference` is stored minus ledger (0.00 = reconciled). Returns 200
-    even when out of balance, so read "status".
-    Errors: 400 month is not in YYYY-MM format
+    The month only shapes the opening / credits / debits / closing columns. Both checks always use
+    every entry. `difference` is stored minus ledger (0.00 = reconciled). Returns 200 even when out
+    of balance, so read "status".
     """
     try:
         month_start = datetime.strptime(month, "%Y-%m")
