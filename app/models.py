@@ -15,6 +15,7 @@ The tables are created by create_table.py.
 """
 
 import enum
+from decimal import Decimal
 
 from sqlalchemy import (
     Column,
@@ -87,7 +88,7 @@ class Account(Base):
     balance = Column(
         Numeric(precision=18, scale=2),
         nullable=False,
-        default=0,
+        default=Decimal("0"),
     )
     is_system = Column(Boolean, nullable=False, default=False)
 

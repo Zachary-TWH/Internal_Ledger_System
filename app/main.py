@@ -146,7 +146,7 @@ def money_str(value: Decimal) -> str:
     Returned in JSON instead of a Decimal, because FastAPI turns a Decimal inside a plain dict
     into a float (60.1), which would lose the exactness the ledger keeps in the database.
     """
-    return str(Decimal(value).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+    return str(Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
 
 def flush_or_409(db: Session):
@@ -330,7 +330,7 @@ def create_account(account: AccountCreate, db: Session = Depends(get_db)):
     new_account = models.Account(
         owner_name=account.owner_name,
         currency=account.currency,
-        balance=0
+        balance=Decimal("0")
     )
     db.add(new_account)
     db.commit()

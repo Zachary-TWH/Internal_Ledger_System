@@ -10,6 +10,8 @@ transfers fail with a 500. On a fresh database they get ids 1 to 4, in this orde
 EXTERNAL USD, FX_POSITION SGD, FX_POSITION USD (the README walkthrough relies on these ids).
 """
 
+from decimal import Decimal
+
 from .database import engine, Base, SessionLocal
 
 # Each model class (Account, Transaction, LedgerEntry) registers its table on Base.metadata at the moment this file runs.
@@ -47,7 +49,7 @@ def main():
                     db.add(models.Account(
                         owner_name=name,
                         currency=ccy,
-                        balance=0,
+                        balance=Decimal("0"),
                         is_system=True,
                     ))
         db.commit()
