@@ -45,13 +45,9 @@ from typing import Literal
 
 SUPPORTED_CURRENCIES = ["USD", "SGD"]
 
-# A cross-currency transfer must be at least this much, in the SOURCE account's currency.
-# The destination amount is rounded to 2 decimals, so a tiny amount at a low rate could round
-# to 0.00 and fail the ledger's "amount > 0" rule. A minimum of 10 keeps the converted amount
-# positive for any rate above 0.0005.
+# Minimum cross-currency transfer, in the SOURCE currency (README assumption 7).
 MIN_CROSS_CURRENCY_AMOUNT = Decimal("10")
 
-# Free, no-API-key FX rate service (European Central Bank reference rates, updated on working days)
 FRANKFURTER_URL = "https://api.frankfurter.dev/v1/latest"
 FX_TIMEOUT_SECONDS = 5
 
@@ -210,7 +206,6 @@ class DepositRequest(BaseModel):
     @field_validator("amount")
     @classmethod
     def amount_must_be_positive(cls, value):
-        # e.g. 100 and 10.50 are valid; -50, 0 and 10.005 are not
         return validate_amount(value)
 
 
@@ -277,20 +272,16 @@ def deposit(req: DepositRequest, db: Session = Depends(get_db)):
       422  invalid body (amount, or a missing field)
       500  the EXTERNAL account has not been created
     """
-    # idempotency check: has this exact request been processed before?
     reject_duplicate_key(db, req.idempotency_key)
 
-    # with_for_update() locks the row so no other transaction can modify it until we commit or rollback
     account = db.query(models.Account).filter_by(id=req.account_id).with_for_update().first()
     if not account:
         raise HTTPException(status_code=404, detail="Account not found")
     if account.is_system:
         raise HTTPException(status_code=400, detail="System accounts cannot be used here")
 
-    # lock this currency's EXTERNAL account too (after the user's row, always in this order)
     external = lock_system_account(db, "EXTERNAL", account.currency)
 
-    # create the transaction record
     txn = models.Transaction(
         idempotency_key=req.idempotency_key,
         type=models.TransactionType.DEPOSIT,
@@ -299,7 +290,6 @@ def deposit(req: DepositRequest, db: Session = Depends(get_db)):
     db.add(txn)
     flush_or_409(db)  # gets txn.id without committing yet
 
-    # two ledger entries: debit EXTERNAL, credit the user's account
     debit_entry = models.LedgerEntry(
         transaction_id=txn.id,
         account_id=external.id,
@@ -314,11 +304,9 @@ def deposit(req: DepositRequest, db: Session = Depends(get_db)):
     )
     db.add_all([debit_entry, credit_entry])
 
-    # update both balances: the user gains, EXTERNAL goes down by the same amount
     account.balance += req.amount
     external.balance -= req.amount
 
-    # commit everything together atomically: all or nothing
     commit_or_409(db)
     db.refresh(account)
     return {"transaction_id": txn.id, "new_balance": money_str(account.balance)}
@@ -336,28 +324,20 @@ def withdraw(req: WithdrawalRequest, db: Session = Depends(get_db)):
       422  invalid body (amount, or a missing field)
       500  the EXTERNAL account has not been created
     """
-    # example values below: req.idempotency_key = "wdr-001", balance = 100, req.amount = 40
-
-    # check if this exact request was already processed before
     reject_duplicate_key(db, req.idempotency_key)
-     
-    # with_for_update() locks the row so no other transaction can modify it until we commit or rollback
+
     account = db.query(models.Account).filter_by(id=req.account_id).with_for_update().first()
     if not account:
         raise HTTPException(status_code=404, detail="Account not found")
     if account.is_system:
         raise HTTPException(status_code=400, detail="System accounts cannot be used here")
-   
-    # does the account have enough money? (e.g. balance 100 >= amount 40)
-    # Checked BEFORE locking EXTERNAL: the user's row is already locked, so the balance cannot
-    # change, and a rejected withdrawal never queues on the shared EXTERNAL row.
+
+    # Check before locking EXTERNAL, so a rejected withdrawal never queues on the shared EXTERNAL row.
     if account.balance < req.amount:
         raise HTTPException(status_code=400, detail="Insufficient funds")
 
-    # lock this currency's EXTERNAL account too (after the user's row, always in this order)
     external = lock_system_account(db, "EXTERNAL", account.currency)
 
-    # create one transaction record grouping the two ledger entries together
     txn = models.Transaction(
         idempotency_key=req.idempotency_key,
         type=models.TransactionType.WITHDRAWAL,
@@ -366,14 +346,12 @@ def withdraw(req: WithdrawalRequest, db: Session = Depends(get_db)):
     db.add(txn)
     flush_or_409(db)  # get txn.id without committing yet
 
-    # debit the user's account (money leaving the account)
     debit_entry = models.LedgerEntry(
         transaction_id=txn.id,
         account_id=account.id,
         entry_type=models.EntryType.DEBIT,
         amount=req.amount
     )
-    # credit EXTERNAL (money leaving the system)
     credit_entry = models.LedgerEntry(
         transaction_id=txn.id,
         account_id=external.id,
@@ -382,11 +360,9 @@ def withdraw(req: WithdrawalRequest, db: Session = Depends(get_db)):
     )
     db.add_all([debit_entry, credit_entry])
 
-    # update both balances: 100 - 40 = 60 for the user, and EXTERNAL goes up by 40
     account.balance -= req.amount
     external.balance += req.amount
 
-    # commit everything together atomically: all or nothing
     commit_or_409(db)
     db.refresh(account)
     return {"transaction_id": txn.id, "new_balance": money_str(account.balance)}
@@ -410,18 +386,13 @@ def transfer(req: TransferRequest, db: Session = Depends(get_db)):
       422  invalid body (amount, or a missing field)
       503  cross-currency and the live FX rate is unavailable (nothing is recorded)
     """
-    # check if this exact transfer was already processed before
     reject_duplicate_key(db, req.idempotency_key)
 
-    # prevent transferring to yourself
     if req.from_account_id == req.to_account_id:
         raise HTTPException(status_code=400, detail="Cannot transfer to the same account")
 
-    # Work out whether this is a cross-currency transfer BEFORE locking anything.
-    # We select plain columns (not Account objects) so no stale balance is cached in this
-    # session; the locked read below is the only one that loads balances. A currency never
-    # changes after an account is created, so reading it without a lock is safe. The same goes
-    # for is_system, which is set when the account is created and never changes.
+    # Currency and is_system never change after creation, so they are read without a lock (plain
+    # columns, so no stale balance is cached in this session).
     rows = (
         db.query(models.Account.id, models.Account.currency, models.Account.is_system)
         .filter(models.Account.id.in_([req.from_account_id, req.to_account_id]))
@@ -429,21 +400,17 @@ def transfer(req: TransferRequest, db: Session = Depends(get_db)):
     )
     if len(rows) != 2:
         raise HTTPException(status_code=404, detail="Account not found")
-    # System accounts (EXTERNAL, FX_POSITION) only move through the code paths that post to
-    # them. Refuse here, before any FX call or row lock.
     if any(row.is_system for row in rows):
         raise HTTPException(status_code=400, detail="System accounts cannot be used here")
     currencies = {row.id: row.currency for row in rows}
 
     exchange_rate_used = None
     if currencies[req.from_account_id] != currencies[req.to_account_id]:
-        # Too small to convert safely: refuse before the network call or any row lock.
         if req.amount < MIN_CROSS_CURRENCY_AMOUNT:
             raise HTTPException(
                 status_code=400,
                 detail=f"Cross-currency transfers must be at least {MIN_CROSS_CURRENCY_AMOUNT} in the source currency",
             )
-        # Network call happens here, with no row locks held. Fail closed if it does not work.
         try:
             exchange_rate_used, _rate_date = fetch_fx_rate(
                 currencies[req.from_account_id], currencies[req.to_account_id]
@@ -451,35 +418,27 @@ def transfer(req: TransferRequest, db: Session = Depends(get_db)):
         except FxRateError as exc:
             raise HTTPException(status_code=503, detail=f"Cannot transfer across currencies right now: {exc.message}")
 
-    # always lock in consistent id order to prevent deadlocks
-    # (e.g. A->B and B->A at the same time both lock the lower id first)
+    # lock in ascending id order so opposite transfers cannot deadlock
     lock_first_id = min(req.from_account_id, req.to_account_id)
     lock_second_id = max(req.from_account_id, req.to_account_id)
 
-    # load both accounts with row locks (SELECT ... FOR UPDATE)
-    # Both rows exist: the early read above already returned 404 for a missing account, and
-    # accounts are never deleted, so no second "not found" check is needed here.
+    # Both rows exist: the early read above already returned 404 otherwise (accounts are never deleted).
     first = db.query(models.Account).filter_by(id=lock_first_id).with_for_update().first()
     second = db.query(models.Account).filter_by(id=lock_second_id).with_for_update().first()
 
-    # map the locked rows back to source and destination
     from_account = first if first.id == req.from_account_id else second
     to_account = second if second.id == req.to_account_id else first
 
-    # does the source have enough money? (checked in the source's own currency, before conversion)
     if from_account.balance < req.amount:
         raise HTTPException(status_code=400, detail="Insufficient funds")
 
     if exchange_rate_used is None:
-        # same currency: no conversion needed
         credited_amount = req.amount
     else:
-        # different currencies: convert with the live rate fetched above, rounded to the
-        # 2 decimal places every amount is stored at (so the entry and the balance agree)
+        # convert with the rate fetched above, rounded once to 2 dp
         credited_amount = (req.amount * exchange_rate_used).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
-    # Cross-currency: also lock the two FX_POSITION accounts (after the customer rows).
-    # One query with ORDER BY id, so the locks are always taken in the same order.
+    # cross-currency: also lock both FX_POSITION rows, in id order, after the customer rows
     fx_from = fx_to = None
     if exchange_rate_used is not None:
         fx_rows = (
@@ -499,7 +458,6 @@ def transfer(req: TransferRequest, db: Session = Depends(get_db)):
         fx_from = fx_by_currency[from_account.currency]
         fx_to = fx_by_currency[to_account.currency]
 
-    # create one transaction record grouping all of the ledger entries together
     txn = models.Transaction(
         idempotency_key=req.idempotency_key,
         type=models.TransactionType.TRANSFER,
@@ -515,14 +473,11 @@ def transfer(req: TransferRequest, db: Session = Depends(get_db)):
         )
 
     if fx_from is None:
-        # same currency: debit the source, credit the destination
         db.add_all([
             entry(from_account, models.EntryType.DEBIT, req.amount),
             entry(to_account, models.EntryType.CREDIT, credited_amount),
         ])
     else:
-        # cross-currency: the source currency goes into FX_POSITION and the destination
-        # currency comes out of it, so each currency's entries net to zero on their own
         db.add_all([
             entry(from_account, models.EntryType.DEBIT, req.amount),
             entry(fx_from, models.EntryType.CREDIT, req.amount),
@@ -532,11 +487,9 @@ def transfer(req: TransferRequest, db: Session = Depends(get_db)):
         fx_from.balance += req.amount
         fx_to.balance -= credited_amount
 
-    # update the customer balances, each in their own currency
     from_account.balance -= req.amount
     to_account.balance += credited_amount
 
-    # commit everything together atomically: all or nothing
     commit_or_409(db)
     db.refresh(from_account)
     db.refresh(to_account)
@@ -561,7 +514,6 @@ def reverse_transaction(transaction_id: int, req: ReversalRequest, db: Session =
       422  the body has no idempotency_key
       500  the original transaction has no ledger entries (should never happen)
     """
-    # check if this exact request was already processed before
     reject_duplicate_key(db, req.idempotency_key)
 
     # Lock the original transaction's row so two reversals of it run one at a time. Nothing else
@@ -589,8 +541,7 @@ def reverse_transaction(transaction_id: int, req: ReversalRequest, db: Session =
     if not original_entries:
         raise HTTPException(status_code=500, detail="Original transaction has no ledger entries")
 
-    # Lock every account involved, in the same order as the other endpoints
-    # (customer accounts by id first, then system accounts by id), so requests cannot deadlock.
+    # Lock every account involved: customers by id first, then system accounts by id
     account_ids = {entry.account_id for entry in original_entries}
     accounts = (
         db.query(models.Account)
@@ -610,7 +561,6 @@ def reverse_transaction(transaction_id: int, req: ReversalRequest, db: Session =
         else:
             new_balance[entry.account_id] -= entry.amount
 
-    # Customers may not go below zero. System accounts (EXTERNAL, FX_POSITION) may be negative.
     for account_id, balance in new_balance.items():
         if balance < 0 and not account_by_id[account_id].is_system:
             raise HTTPException(
@@ -618,7 +568,6 @@ def reverse_transaction(transaction_id: int, req: ReversalRequest, db: Session =
                 detail=f"Cannot reverse: account {account_id} no longer holds enough to give the money back",
             )
 
-    # the new transaction, linked to the original
     reversal = models.Transaction(
         idempotency_key=req.idempotency_key,
         type=models.TransactionType.REVERSAL,
@@ -629,7 +578,6 @@ def reverse_transaction(transaction_id: int, req: ReversalRequest, db: Session =
     db.add(reversal)
     flush_or_409(db)  # get reversal.id without committing yet
 
-    # one offsetting entry per original entry: same account, same amount, opposite direction
     reversed_entries = []
     for entry in original_entries:
         opposite = (
@@ -647,12 +595,10 @@ def reverse_transaction(transaction_id: int, req: ReversalRequest, db: Session =
     for account_id, balance in new_balance.items():
         account_by_id[account_id].balance = balance
 
-    # commit everything together atomically: all or nothing
     try:
         db.commit()
     except IntegrityError:
-        # the unique constraints are the last line of defence against a race
-        # (same idempotency_key twice, or the same transaction reversed twice)
+        # unique constraints catch a race (same key twice, or same transaction reversed twice)
         db.rollback()
         raise HTTPException(status_code=409, detail="Duplicate request or transaction already reversed")
 
@@ -690,19 +636,14 @@ def get_transactions(account_id: int, db: Session = Depends(get_db), page: int =
     in this account's own currency.
     Errors: 404 account not found, 422 invalid page, page_size or order
     """
-    # check account exists first
     account = db.query(models.Account).filter_by(id=account_id).first()
     if not account:
         raise HTTPException(status_code=404, detail="Account not found")
 
-    # calculate how many rows to skip
-    # page 1: skip 0, page 2: skip 20, page 3: skip 40
+    # rows to skip, e.g. page 2 with page_size 20 skips 20
     offset = (page - 1) * page_size
 
-    # fetch this page of ledger entries for the account
-    # each entry links to a transaction, so we can see the full history
-    # the timestamp lives on the transaction, so join to it and sort on created_at;
-    # the entry id is the tiebreaker (two entries can share the same created_at)
+    # created_at lives on the transaction; entry id is the tiebreaker for equal timestamps
     if order == "asc":
         sort_by = (models.Transaction.created_at.asc(), models.LedgerEntry.id.asc())
     else:
@@ -718,7 +659,6 @@ def get_transactions(account_id: int, db: Session = Depends(get_db), page: int =
         .all()
     )
 
-    # shape the response: for each entry, return the relevant details
     result = []
     for entry in entries:
         result.append({
@@ -766,7 +706,6 @@ def fx_convert(from_currency: str, to_currency: str, amount: Decimal = Decimal("
     if amount <= 0:
         raise HTTPException(status_code=400, detail="Amount must be greater than zero")
 
-    # same currency: nothing to look up
     if from_currency == to_currency:
         return {
             "from_currency": from_currency,
@@ -846,9 +785,8 @@ def month_end_reconciliation(month: str, db: Session = Depends(get_db)):
     before_month = Txn.created_at < month_start
     in_month = and_(Txn.created_at >= month_start, Txn.created_at < next_month_start)
 
-    # ONE query reads each stored balance and that account's ledger sums together, so Postgres
-    # gives them all the same snapshot. Both checks below are built from this one result.
-    # Outer joins keep an account that has no entries yet (its ledger balance is 0.00).
+    # One query reads balances and ledger sums together, so they share one snapshot (see README).
+    # Outer joins keep accounts that have no entries yet (ledger balance 0.00).
     rows = (
         db.query(
             Account,
@@ -870,10 +808,8 @@ def month_end_reconciliation(month: str, db: Session = Depends(get_db)):
     mismatched = 0
     per_currency = {}   # currency -> running totals of STORED balances, for check 2
     for account, credits_all, debits_all, credits_before, debits_before, credits_month, debits_month in rows:
-        # stored       = the live accounts.balance column.
-        # ledger_balance = credits minus debits over ALL entries ever posted. Check 1 compares the two.
-        # opening / month_credits / month_debits = the same sum limited to entries before the month /
-        # inside it, using the transaction's created_at. closing = opening + credits - debits.
+        # stored = live accounts.balance; ledger_balance = credits - debits over ALL entries.
+        # opening / month_credits / month_debits only count entries before / inside the month.
         stored = _money(account.balance)
         ledger_balance = _money(credits_all) - _money(debits_all)
         opening = _money(credits_before) - _money(debits_before)
@@ -902,7 +838,6 @@ def month_end_reconciliation(month: str, db: Session = Depends(get_db)):
             "status": status,
         })
 
-        # Check 2 input: add each stored balance to its currency's totals
         totals = per_currency.setdefault(
             account.currency,
             {"customers": Decimal("0"), "external": Decimal("0"), "fx_position": Decimal("0"), "net": Decimal("0")},
@@ -927,12 +862,10 @@ def month_end_reconciliation(month: str, db: Session = Depends(get_db)):
             "status": "OK" if totals["net"] == 0 else "OUT_OF_BALANCE",
         })
 
-    # RECONCILED only if every account matches its own entries (check 1) AND every currency
-    # nets to exactly 0.00 (check 2)
     balanced = mismatched == 0 and all(c["status"] == "OK" for c in currencies)
     return {
         "month": month,
-        # false = the month is still in progress (created_at follows the database server clock, stored without a timezone)
+        # false while the month is in progress (created_at is the DB server clock, no timezone)
         "month_has_ended": datetime.now(timezone.utc).replace(tzinfo=None) >= next_month_start,
         "status": "RECONCILED" if balanced else "OUT_OF_BALANCE",
         "summary": {
