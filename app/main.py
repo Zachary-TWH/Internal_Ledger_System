@@ -11,13 +11,37 @@ Model
                  DEBIT source, CREDIT FX_POSITION (source currency),
                  DEBIT FX_POSITION (destination currency), CREDIT destination.
 - System accounts' balances move with every entry, exactly like a customer's. So adding up
-  `accounts.balance` per currency must give 0.00. That is the month-end reconciliation.
+  `accounts.balance` per currency must give 0.00. That sum is check 2 of the month-end
+  reconciliation; check 1 compares each account's stored balance with its own ledger entries.
 - Amounts are Decimal (never float). Only USD and SGD are supported (2 decimal places).
 - Append-only: ledger entries and transactions are never edited or deleted. Every transaction
   has a `type` (DEPOSIT, WITHDRAWAL, TRANSFER, REVERSAL). A mistake is undone by POST
   /transactions/{id}/reverse, which posts a NEW REVERSAL transaction whose entries offset the
   original's (same accounts and amounts, DEBIT and CREDIT swapped). `reversal_of` is UNIQUE, so
   a transaction can only be reversed once, and a REVERSAL itself cannot be reversed.
+
+Endpoints
+---------
+POST /accounts                    create a customer account (USD or SGD, starts at 0.00)
+POST /deposit                     money in from EXTERNAL
+POST /withdraw                    money out to EXTERNAL (no overdraft)
+POST /transactions                transfer between two customer accounts (converted if the currencies differ)
+POST /transactions/{id}/reverse   undo a transaction by posting a new REVERSAL transaction
+GET  /accounts/{id}               one account and its current balance
+GET  /accounts/{id}/transactions  the account's ledger entries, paginated
+GET  /fx/convert                  read-only live FX quote (touches no account)
+GET  /reconciliation/month-end    read-only two-part reconciliation report
+
+Conventions
+-----------
+- Money in a response is a 2-decimal string such as "60.00" (never a float), and
+  `exchange_rate_used` is a 6-decimal string such as "1.350000".
+- Status codes: 400 a business rule refused the request (insufficient funds, system account, ...),
+  404 unknown id, 409 duplicate idempotency_key or transaction already reversed, 422 the request
+  body or query failed validation, 503 the live FX rate was unavailable, 500 a system account is
+  missing (setup problem, see create_table.py).
+- No authentication: anyone who can reach the API can act on any account (a deliberate
+  simplification, see the README).
 
 Safety rules used by every write endpoint
 -----------------------------------------
@@ -62,7 +86,12 @@ FX_TIMEOUT_SECONDS = 5
 
 
 class FxRateError(Exception):
-    """The live FX rate could not be obtained (pass or fail: no distinction between causes)."""
+    """Raised when the live FX rate cannot be obtained or cannot be trusted.
+
+    A network failure, timeout, HTTP error, malformed response and a non-positive rate all raise
+    this same error. The caller does not need to know which: it only needs to refuse the request
+    (fail closed). `message` is a fixed string, so it is safe to show to the client.
+    """
 
     def __init__(self, message: str):
         super().__init__(message)
@@ -74,6 +103,8 @@ def fetch_fx_rate(from_currency: str, to_currency: str):
 
     Returns (rate, rate_date). The rate is a Decimal rounded to 6 places (half up), the scale of
     transactions.exchange_rate_used, so the rate we use is exactly the rate we store.
+    rate_date is the publication date of the rate as "YYYY-MM-DD" (None if the response has no
+    date). It is the date the rate was published, which on a weekend is the last working day.
     Raises FxRateError on any network, HTTP or response-format problem. Never returns a
     guessed or cached rate: if the service cannot be reached, the caller must refuse the request.
     """
@@ -119,7 +150,15 @@ def money_str(value: Decimal) -> str:
 
 
 def flush_or_409(db: Session):
-    """Send the pending INSERTs to the database, turning a duplicate idempotency_key into a 409."""
+    """Send the pending INSERTs to the database now, turning a duplicate idempotency_key into a 409.
+
+    Flushing early does two jobs: it gives the new transaction its id (the ledger entries need
+    it), and it makes the UNIQUE constraint on transactions.idempotency_key fire at this point
+    instead of at the final commit. On a clash the session is rolled back, which releases every
+    row lock taken so far, and the caller gets the same 409 a plain retry would get.
+    Any IntegrityError here is reported as a 409. In practice that is the idempotency key, and in
+    reverse_transaction it can also be the UNIQUE reversal_of (the same transaction reversed twice).
+    """
     try:
         db.flush() 
     except IntegrityError:
@@ -159,6 +198,9 @@ def lock_system_account(db: Session, owner_name: str, currency: str) -> models.A
 
     Only rows with is_system = true count, so a customer cannot create an account called
     "EXTERNAL" through POST /accounts and have money routed to it.
+
+    Call this only AFTER the customer account rows are locked. Every endpoint takes its locks in
+    the same order (customers by id, then system accounts by id), which is what prevents deadlocks.
     """
     account = (
         db.query(models.Account)
@@ -171,6 +213,7 @@ def lock_system_account(db: Session, owner_name: str, currency: str) -> models.A
     return account
 
 
+# NUMERIC(18,2) holds 18 digits in total, 2 of them after the decimal point, so 16 before it.
 MAX_AMOUNT = Decimal("9999999999999999.99")  # largest value that fits NUMERIC(18,2)
 
 
@@ -196,7 +239,12 @@ def validate_amount(value: Decimal) -> Decimal:
 # ---------------------------------------------------------------------------
 
 class AccountCreate(BaseModel):
-    """Body of POST /accounts."""
+    """Body of POST /accounts.
+
+    `currency` is case-insensitive ("sgd" is stored as "SGD") and defaults to USD.
+    `owner_name` is free text: it is not validated and need not be unique. Naming an account
+    "EXTERNAL" gives it no special powers, because only is_system rows count as system accounts.
+    """
     owner_name: str
     currency: str = "USD"
 
@@ -273,7 +321,11 @@ class ReversalRequest(BaseModel):
 def create_account(account: AccountCreate, db: Session = Depends(get_db)):
     """Create a new account with a zero balance.
 
+    Always creates a customer account (is_system is false). System accounts are created only by
+    app/create_table.py.
+
     Returns the created account (id, owner_name, currency, balance).
+    Errors: 422 unsupported currency (only USD and SGD) or a missing field
     """
     new_account = models.Account(
         owner_name=account.owner_name,
@@ -299,6 +351,8 @@ def deposit(req: DepositRequest, db: Session = Depends(get_db)):
       409  idempotency_key was already used
       404  account not found
       400  the account is a system account (EXTERNAL or FX_POSITION), which customers cannot use
+      422  invalid body: amount not above zero, more than 2 decimal places or too large,
+           or a missing field
       500  the EXTERNAL account has not been created
     """
     # idempotency check: has this exact request been processed before?
@@ -361,6 +415,8 @@ def withdraw(req: WithdrawalRequest, db: Session = Depends(get_db)):
       404  account not found
       400  the account is a system account (EXTERNAL or FX_POSITION), which customers cannot use
       400  insufficient funds
+      422  invalid body: amount not above zero, more than 2 decimal places or too large,
+           or a missing field
       500  the EXTERNAL account has not been created
     """
     # example values below: req.idempotency_key = "wdr-001", balance = 100, req.amount = 40
@@ -423,6 +479,8 @@ def withdraw(req: WithdrawalRequest, db: Session = Depends(get_db)):
 def transfer(req: TransferRequest, db: Session = Depends(get_db)):
     """Move money from one account to another in a single atomic operation.
 
+    This is the POST /transactions endpoint (the function keeps the name `transfer`).
+
     `amount` is in the source account's currency. If the two accounts use different
     currencies, a live rate (source -> destination) is fetched from the Frankfurter API at
     execution time, and the destination is credited the converted amount (rounded to 2 dp)
@@ -436,6 +494,11 @@ def transfer(req: TransferRequest, db: Session = Depends(get_db)):
     The rate is fetched BEFORE any row lock is taken, so a slow FX service never holds up
     other transfers on these accounts. If the rate cannot be fetched the transfer is refused
     (fail closed); a stale or guessed rate is never used. Same-currency transfers never call the API.
+
+    Order of checks: the cheap ones run first, before any lock or network call: duplicate key, same
+    account, both accounts exist, neither is a system account, then (cross-currency only) the
+    minimum amount and the FX fetch. Only after that are the rows locked and the balance checked,
+    so the balance test always sees the latest committed value.
 
     Ledger entries, same currency (2):
       DEBIT source, CREDIT destination.
@@ -453,6 +516,8 @@ def transfer(req: TransferRequest, db: Session = Depends(get_db)):
       400  either account is a system account (EXTERNAL or FX_POSITION), which customers cannot use
       400  cross-currency transfer below the minimum (10 in the source currency)
       400  insufficient funds in the source account
+      422  invalid body: amount not above zero, more than 2 decimal places or too large,
+           or a missing field
       503  cross-currency transfer and the live FX rate is unavailable (nothing is recorded)
     """
     # check if this exact transfer was already processed before
@@ -620,6 +685,8 @@ def reverse_transaction(transaction_id: int, req: ReversalRequest, db: Session =
       400  a customer account no longer holds enough money to reverse (for example the
            recipient already spent it). Reversing then needs a separate process (a dispute or
            a compensating transfer), which this API does not provide.
+      422  the body has no idempotency_key
+      500  the original transaction has no ledger entries (should never happen)
     """
     # check if this exact request was already processed before
     reject_duplicate_key(db, req.idempotency_key)
@@ -730,6 +797,9 @@ def reverse_transaction(transaction_id: int, req: ReversalRequest, db: Session =
 def get_account(account_id: int, db: Session = Depends(get_db)):
     """Return one account and its current balance (always read from the database).
 
+    Also works for system accounts (EXTERNAL, FX_POSITION), so their balances can be audited.
+    It is a plain read of the latest committed balance: no cache and no row lock.
+
     Errors: 404 account not found
     """
     account = db.query(models.Account).filter_by(id=account_id).first()
@@ -747,6 +817,10 @@ def get_transactions(account_id: int, db: Session = Depends(get_db), page: int =
               "reversal_of", "entry_type", "amount", "description", "created_at"}]}
     `type` is DEPOSIT, WITHDRAWAL, TRANSFER or REVERSAL. `reversal_of` is the id of the
     transaction a REVERSAL undoes (null for every other type).
+    The history lists ledger ENTRIES, not transactions: a transfer shows up once on each account
+    it touches. `amount` is in this account's own currency. A cross-currency transfer is one entry
+    here (the conversion legs sit on the FX_POSITION accounts). `created_at` is the transaction's
+    time on the database server clock, without a timezone.
     Entries are ordered by the transaction's created_at, then by entry id,
     so the order is stable when two entries share the same timestamp and pages never overlap.
     Errors: 404 account not found, 422 page < 1, page_size outside 1-100, or order is not "asc" or "desc"
@@ -814,11 +888,15 @@ def fx_convert(from_currency: str, to_currency: str, amount: Decimal = Decimal("
     Read-only quote tool: it does not touch any account or the ledger. Nothing is stored; POST /transactions
     fetches its own live rate at execution time and saves only the rate it actually used.
     The rate is parsed as a Decimal (never float) and the result is rounded to 2 decimal places.
+    Unlike POST /transactions it does not apply the 2-decimal or minimum-amount rules, so a quote
+    can succeed for a transfer that would be refused (for example 5 USD to SGD is below the minimum).
+    `rate` is the ECB daily reference rate and `rate_date` is the day it was published (see README).
 
     Returns: {"from_currency", "to_currency", "amount", "rate", "converted_amount",
               "rate_date", "source"}
     Errors:
       400  unsupported currency, or amount is not greater than zero
+      422  amount is not a number
       503  the rate could not be fetched (timeout, error or bad response from Frankfurter)
     """
     from_currency = from_currency.upper()
@@ -867,7 +945,11 @@ def fx_convert(from_currency: str, to_currency: str, amount: Decimal = Decimal("
 # ---------------------------------------------------------------------------
 
 def _money(value) -> Decimal:
-    """Round a database sum to 2 decimal places (the scale every amount is stored at)."""
+    """Round a database sum to 2 decimal places (the scale every amount is stored at).
+
+    None (a sum over no rows) counts as 0.00. The value goes through str() first so a float from
+    a database driver cannot add binary rounding noise.
+    """
     return Decimal(str(value or 0)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
 
@@ -901,6 +983,11 @@ def month_end_reconciliation(month: str, db: Session = Depends(get_db)):
     Amounts are strings with 2 decimal places. `difference` is stored minus ledger, so 0.00 means
     reconciled. opening/closing are ledger balances at the start and end of the month.
     Returns 200 even when out of balance; read "status".
+    The overall status is OUT_OF_BALANCE if any account is a MISMATCH or any currency's net is
+    not 0.00. `accounts_checked` counts every account, system accounts included.
+    The month never filters the two checks, which always use every entry. It only decides which
+    entries count as before / inside the month for the four activity columns. `month_has_ended`
+    is false while the month is still in progress, so those columns are then only partial.
     Errors: 400 month is not in YYYY-MM format
     """
     try:
@@ -951,6 +1038,10 @@ def month_end_reconciliation(month: str, db: Session = Depends(get_db)):
     mismatched = 0
     per_currency = {}   # currency -> running totals of STORED balances, for check 2
     for account, credits_all, debits_all, credits_before, debits_before, credits_month, debits_month in rows:
+        # stored       = the live accounts.balance column.
+        # ledger_balance = credits minus debits over ALL entries ever posted. Check 1 compares the two.
+        # opening / month_credits / month_debits = the same sum limited to entries before the month /
+        # inside it, using the transaction's created_at. closing = opening + credits - debits.
         stored = _money(account.balance)
         ledger_balance = _money(credits_all) - _money(debits_all)
         opening = _money(credits_before) - _money(debits_before)
@@ -1004,6 +1095,8 @@ def month_end_reconciliation(month: str, db: Session = Depends(get_db)):
             "status": "OK" if totals["net"] == 0 else "OUT_OF_BALANCE",
         })
 
+    # RECONCILED only if every account matches its own entries (check 1) AND every currency
+    # nets to exactly 0.00 (check 2)
     balanced = mismatched == 0 and all(c["status"] == "OK" for c in currencies)
     return {
         "month": month,

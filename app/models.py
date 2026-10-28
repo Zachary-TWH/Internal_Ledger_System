@@ -1,7 +1,17 @@
 """SQLAlchemy models for the financial ledger.
 
+Three tables:
+    accounts        one row per account (customer or system), with a stored balance
+    transactions    one row per business event (deposit, withdrawal, transfer, reversal)
+    ledger_entries  the DEBIT / CREDIT postings, 2 or 4 per transaction. The source of truth.
+
+    accounts 1 ---- * ledger_entries * ---- 1 transactions
+    transactions.reversal_of points back at another row of the same table (a reversal and the
+    transaction it undoes).
+
 These models define the database schema. They do not implement transaction
-processing, balance updates, FX pricing, or netting logic.
+processing, balance updates, FX pricing, or netting logic: that all lives in main.py.
+The tables are created by create_table.py.
 """
 
 import enum
@@ -24,14 +34,24 @@ from .database import Base
 
 
 class EntryType(str, enum.Enum):
-    """Direction of a ledger posting."""
+    """Direction of a ledger posting.
+
+    A DEBIT lowers the account's stored balance and a CREDIT raises it, for every kind of account
+    (system accounts included). The entry's amount is always positive, so the direction lives here.
+    """
 
     DEBIT = "DEBIT"
     CREDIT = "CREDIT"
 
 
 class TransactionType(str, enum.Enum):
-    """What kind of business event a transaction is. Code checks this, not the description."""
+    """What kind of business event a transaction is. Code checks this, not the description.
+
+    DEPOSIT     money in from outside:  DEBIT EXTERNAL, CREDIT the customer.
+    WITHDRAWAL  money out to outside:   DEBIT the customer, CREDIT EXTERNAL.
+    TRANSFER    customer to customer, in one currency (2 entries) or across two (4 entries, via FX_POSITION).
+    REVERSAL    undoes an earlier transaction with offsetting entries. See Transaction.reversal_of.
+    """
 
     DEPOSIT = "DEPOSIT"
     WITHDRAWAL = "WITHDRAWAL"
@@ -46,6 +66,17 @@ class Account(Base):
     ledger postings. The ledger should provide the audit trail.
     `is_system` marks internal accounts such as EXTERNAL, which users
     cannot create through the API.
+
+    Columns:
+      owner_name  free text and not unique. System accounts use the fixed names EXTERNAL and FX_POSITION.
+      currency    "USD" or "SGD", fixed at creation. Every entry on the account is in this currency.
+      balance     NUMERIC(18,2), changed by every posting, for customer and system accounts alike.
+                  The ledger entries are the source of truth: month-end reconciliation compares them.
+                  A customer balance is never allowed below zero, but that rule is enforced in
+                  main.py, not by a database constraint. System balances may go negative
+                  (EXTERNAL is negative once more has come in than gone out).
+      is_system   true only for the 4 accounts seeded by create_table.py (EXTERNAL and FX_POSITION,
+                  one of each per currency). Always false for accounts made through POST /accounts.
     """
 
     __tablename__ = "accounts"
@@ -64,7 +95,9 @@ class Transaction(Base):
     """A business event grouping related ledger entries.
 
     `idempotency_key` prevents duplicate processing when enforced by the
-    transaction-processing service and database constraint.
+    transaction-processing service and database constraint. It is UNIQUE, and every write
+    endpoint sets it, so a retried request is rejected with a 409. (The column itself is
+    nullable, but the API always supplies a value.)
     `exchange_rate_used` records the live FX rate actually applied to a cross-currency
     transfer (null otherwise). It is the only place a rate is stored: there is no rates table.
 
@@ -74,6 +107,13 @@ class Transaction(Base):
     transaction a REVERSAL undoes. It is UNIQUE, so one transaction can be reversed at most
     once (a second reversal violates the constraint), and the CHECK below ties it to the type:
     only a REVERSAL has a `reversal_of`, and every REVERSAL has one.
+
+    Other columns:
+      description  a human-readable label ("Deposit", "Reversal of transaction 4"). Never used for
+                   logic: code checks `type`.
+      created_at   set by the database server clock when the row is inserted, stored without a
+                   timezone. Month-end reconciliation uses it to place entries in a month.
+      notes        optional free text. No endpoint sets or returns it yet.
     """
 
     __tablename__ = "transactions"
@@ -111,6 +151,11 @@ class LedgerEntry(Base):
 
     Entries belong to a transaction. Financial posting logic must ensure
     that each transaction satisfies the applicable balancing rules.
+
+    The balancing rule is: within each currency, a transaction's DEBIT amounts equal its CREDIT
+    amounts. main.py guarantees this when it posts; no database constraint checks it.
+    `amount` is always positive (see the CHECK below) and is in the currency of `account`: there
+    is no currency column on the entry. `entry_type` gives the direction. Entries are append-only.
     """
 
     __tablename__ = "ledger_entries"

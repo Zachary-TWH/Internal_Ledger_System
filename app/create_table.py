@@ -1,3 +1,15 @@
+"""One-off setup script: create the tables and seed the system accounts.
+
+Run it once before the API starts (entrypoint.sh does this on every container start):
+    python -m app.create_table
+It is safe to re-run. It only creates what is missing and never alters or drops anything.
+
+It seeds 4 system accounts (is_system = true): EXTERNAL and FX_POSITION for each of USD and SGD.
+The API never creates these. If one is missing, deposits, withdrawals and cross-currency
+transfers fail with a 500. On a fresh database they get ids 1 to 4, in this order: EXTERNAL SGD,
+EXTERNAL USD, FX_POSITION SGD, FX_POSITION USD (the README walkthrough relies on these ids).
+"""
+
 from .database import engine, Base, SessionLocal
 
 # Each model class (Account, Transaction, LedgerEntry) registers its table on Base.metadata at the moment this file runs.
@@ -13,6 +25,7 @@ SYSTEM_CURRENCIES = ["SGD", "USD"]
 SYSTEM_ACCOUNT_NAMES = ["EXTERNAL", "FX_POSITION"]
 
 def main():
+    """Create any missing tables, then seed any missing system accounts."""
     # Base is the shared parent class of every model in models.py. Base.metadata is the
     # list of all tables those classes defined (accounts, transactions, ledger_entries).
     # create_all() looks at the database, then creates each table in that list that does

@@ -100,7 +100,8 @@ Each assumption below is a rule the ledger follows. Examples use made-up numbers
 
 **12. Timestamps use the database server clock.**
 - `created_at` is stored without a timezone.
-- The month-end report uses it only to say whether the month has ended (`month_has_ended`).
+- The month-end report uses it to split each account's entries into before and inside the month (the `opening_balance`, `total_credits`, `total_debits` and `closing_balance` columns) and to set `month_has_ended`. It does not affect the two checks, which always use every entry.
+- Because the clock has no timezone, month boundaries follow the database server's clock. Run the database in UTC.
 
 **13. No authentication or ownership checks.**
 - Anyone who can reach the API can act on any account.
