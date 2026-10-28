@@ -369,12 +369,14 @@ def withdraw(req: WithdrawalRequest, db: Session = Depends(get_db)):
     if account.is_system:
         raise HTTPException(status_code=400, detail="System accounts cannot be used here")
    
-    # lock this currency's EXTERNAL account too (after the user's row, always in this order)
-    external = lock_system_account(db, "EXTERNAL", account.currency)
-
     # does the account have enough money? (e.g. balance 100 >= amount 40)
+    # Checked BEFORE locking EXTERNAL: the user's row is already locked, so the balance cannot
+    # change, and a rejected withdrawal never queues on the shared EXTERNAL row.
     if account.balance < req.amount:
         raise HTTPException(status_code=400, detail="Insufficient funds")
+
+    # lock this currency's EXTERNAL account too (after the user's row, always in this order)
+    external = lock_system_account(db, "EXTERNAL", account.currency)
 
     # create one transaction record grouping the two ledger entries together
     txn = models.Transaction(
