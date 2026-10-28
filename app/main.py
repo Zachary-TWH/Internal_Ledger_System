@@ -632,56 +632,6 @@ def get_transactions(account_id: int, db: Session = Depends(get_db), page: int =
 
 
 # ---------------------------------------------------------------------------
-# FX conversion (live rate from the Frankfurter API)
-# ---------------------------------------------------------------------------
-
-@app.get("/fx/convert")
-def fx_convert(from_currency: str, to_currency: str, amount: Decimal = Decimal("1")):
-    """Read-only live quote between two supported currencies. Touches no account or ledger row.
-
-    It does not apply the transfer minimum, so a quote can succeed for a transfer that would be refused.
-    """
-    from_currency = from_currency.upper()
-    to_currency = to_currency.upper()
-
-    for ccy in (from_currency, to_currency):
-        if ccy not in SUPPORTED_CURRENCIES:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Unsupported currency {ccy}. Supported: {', '.join(SUPPORTED_CURRENCIES)}",
-            )
-    if amount <= 0:
-        raise HTTPException(status_code=400, detail="Amount must be greater than zero")
-
-    if from_currency == to_currency:
-        return {
-            "from_currency": from_currency,
-            "to_currency": to_currency,
-            "amount": str(amount),
-            "rate": "1",
-            "converted_amount": str(amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)),
-            "rate_date": None,
-            "source": None,
-        }
-
-    try:
-        rate, rate_date = fetch_fx_rate(from_currency, to_currency)
-    except FxRateError as exc:
-        raise HTTPException(status_code=503, detail=exc.message)
-
-    converted = (amount * rate).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-    return {
-        "from_currency": from_currency,
-        "to_currency": to_currency,
-        "amount": str(amount),
-        "rate": str(rate),
-        "converted_amount": str(converted),
-        "rate_date": rate_date,
-        "source": "frankfurter.dev",
-    }
-
-
-# ---------------------------------------------------------------------------
 # Month-end reconciliation
 # ---------------------------------------------------------------------------
 
