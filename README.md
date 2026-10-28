@@ -9,6 +9,7 @@ Each assumption below is a rule the ledger follows. Examples use made-up numbers
 - Python uses `Decimal` for monetary calculations. PostgreSQL uses `NUMERIC(18,2)` for stored monetary amounts.
 - Example: `Decimal("0.10") + Decimal("0.20")` produces exactly `0.30`.
 - The API accepts monetary amounts as decimal values, preferably supplied as JSON strings to avoid floating-point conversion before validation.
+- Request amounts must be greater than zero, have at most 2 decimal places and fit `NUMERIC(18,2)`. Anything else is rejected with 422, so the amount added to a balance is exactly the amount stored in the ledger entry (example: `10.005` is rejected, not silently rounded).
 - Reconciliation responses represent monetary amounts as strings to preserve their exact decimal representation.
 - Rounding uses `ROUND_HALF_UP` at explicitly defined calculation or posting boundaries.
 - Monetary calculations should retain sufficient precision until the applicable boundary. Amounts must not be rounded arbitrarily at every intermediate step.

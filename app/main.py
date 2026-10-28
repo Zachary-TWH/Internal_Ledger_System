@@ -46,7 +46,6 @@ from datetime import datetime, timezone
 from sqlalchemy import func, case, and_
 from sqlalchemy.exc import IntegrityError
 from typing import Literal
-from decimal import Decimal
 
 
 SUPPORTED_CURRENCIES = ["USD", "SGD"]
@@ -156,6 +155,26 @@ def lock_system_account(db: Session, owner_name: str, currency: str) -> models.A
     return account
 
 
+MAX_AMOUNT = Decimal("9999999999999999.99")  # largest value that fits NUMERIC(18,2)
+
+
+def validate_amount(value: Decimal) -> Decimal:
+    """Shared check for every money amount in a request body.
+
+    Must be greater than zero, have at most 2 decimal places and fit NUMERIC(18,2).
+    Rejecting a third decimal up front means the amount we add to the balance is exactly
+    the amount stored in the ledger entry (Postgres would otherwise round the entry
+    silently, and a value like 0.004 would become 0.00 and fail the positive-amount check).
+    """
+    if value <= 0:
+        raise ValueError("Amount must be greater than zero")
+    if value > MAX_AMOUNT:
+        raise ValueError("Amount is too large")
+    if value != value.quantize(Decimal("0.01")):
+        raise ValueError("Amount can have at most 2 decimal places")
+    return value
+
+
 # ---------------------------------------------------------------------------
 # Request / response schemas (Pydantic validates incoming JSON against these)
 # ---------------------------------------------------------------------------
@@ -196,11 +215,8 @@ class DepositRequest(BaseModel):
     @field_validator("amount")
     @classmethod
     def amount_must_be_positive(cls, value):
-        # value is the "amount" from the incoming JSON
-        # e.g. value = 100 (valid), value = -50 (invalid), value = 0 (invalid)
-        if value <= 0:
-            raise ValueError("Amount must be greater than zero")
-        return value
+        # e.g. 100 and 10.50 are valid; -50, 0 and 10.005 are not
+        return validate_amount(value)
 
 
 class WithdrawalRequest(BaseModel):
@@ -212,9 +228,7 @@ class WithdrawalRequest(BaseModel):
     @field_validator("amount")
     @classmethod
     def amount_must_be_positive(cls, value):
-        if value <= 0:
-            raise ValueError("Amount must be greater than zero")
-        return value
+        return validate_amount(value)
 
 
 class TransferRequest(BaseModel):
@@ -227,9 +241,7 @@ class TransferRequest(BaseModel):
     @field_validator("amount")
     @classmethod
     def amount_must_be_positive(cls, value):
-        if value <= 0:
-            raise ValueError("Amount must be greater than zero")
-        return value
+        return validate_amount(value)
 
 
 class ReversalRequest(BaseModel):
@@ -787,8 +799,7 @@ def fx_convert(from_currency: str, to_currency: str, amount: Decimal = Decimal("
               "rate_date", "source"}
     Errors:
       400  unsupported currency, or amount is not greater than zero
-      502  Frankfurter returned an error or an unexpected response
-      504  Frankfurter did not answer in time
+      503  the rate could not be fetched (timeout, error or bad response from Frankfurter)
     """
     from_currency = from_currency.upper()
     to_currency = to_currency.upper()
@@ -976,7 +987,7 @@ def month_end_reconciliation(month: str, db: Session = Depends(get_db)):
     balanced = mismatched == 0 and all(c["status"] == "OK" for c in currencies)
     return {
         "month": month,
-        # false = the month is still in progress (timestamps are UTC, stored without a timezone)
+        # false = the month is still in progress (created_at follows the database server clock, stored without a timezone)
         "month_has_ended": datetime.now(timezone.utc).replace(tzinfo=None) >= next_month_start,
         "status": "RECONCILED" if balanced else "OUT_OF_BALANCE",
         "summary": {
