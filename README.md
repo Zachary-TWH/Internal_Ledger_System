@@ -297,6 +297,7 @@ Each item below is a rule the ledger follows. Examples use made-up numbers.
 - **Consistent under live traffic.** Every balance and ledger sum is read in one SQL statement, so Postgres gives them the same snapshot. A transfer committing mid-report cannot cause a false result.
 - **Limits** (fixes are in the limitations table below):
   - The `month` parameter labels and groups activity, but balances are live. There are no saved snapshots, so it cannot reproduce a past month after later transactions.
+  - It reads the whole ledger on every call. Check 1 needs every entry ever posted, and the opening balance is recomputed from every entry before the month, so a call for one month still sums all the history. With 10 years of entries it scans all 10 years for every account, and it gets slower as the ledger grows. This is fine at this scale. I would fix it with monthly snapshots (see the limitations table).
   - It does not check that each transaction's own entries balance, or that the stored rate matches the amounts.
   - It compares the ledger with itself. It cannot see money that never reached the ledger, or a difference from a real bank statement.
   - Offsetting errors (one account 10 too high, another 10 too low) still sum to zero in check 2, but check 1 flags both accounts.
@@ -405,7 +406,7 @@ These are deliberate simplifications. Each one is a gap I know about, with the f
 | Limitation | Fix I would make |
 |------------|------------------|
 | A duplicate request gets a 409, not the original result, and a retry with different details is not detected | Store the response and a hash of the request body with the key. Return the stored response when the hash matches, and a 422 when it does not |
-| Month-end reads live balances, so a past month cannot be reproduced | A write-once `account_snapshots` table (`account_id`, `month`, `closing_balance`, `last_entry_id`), written by a scheduled job right after the check reports `RECONCILED`. Summing one month's snapshots per currency must give 0.00 |
+| Month-end reads live balances, so a past month cannot be reproduced. It also sums the whole ledger on every call, so it gets slower as history grows | I would add a monthly snapshot. A write-once `account_snapshots` table (`account_id`, `month`, `closing_balance`, `last_entry_id`), written by a scheduled job right after the check reports `RECONCILED`. Summing one month's snapshots per currency must give 0.00. The report would then start from the last snapshot (its `closing_balance` is the opening balance) and sum only the entries after its `last_entry_id`, so the cost depends on one month of activity and not on the whole history |
 | Reconciliation does not check each transaction | One query grouping entries by transaction and currency, flagging any group where debits differ from credits |
 | Reconciliation compares the ledger with itself | Import the real bank or custodian statement and compare its totals with EXTERNAL |
 | EXTERNAL and FX_POSITION are hot rows, so deposits, withdrawals and conversions in one currency run one after another | Split each system account into several sub-accounts and sum them |
