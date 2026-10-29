@@ -1,47 +1,71 @@
 # Internal Ledger System
 
-A small double-entry ledger API built with FastAPI, SQLAlchemy, and PostgreSQL. This take-home focuses on correct money movement, auditable history, and testable failure behavior rather than production deployment.
+A double-entry ledger API built with FastAPI, SQLAlchemy, and PostgreSQL. This take-home prioritizes correct, auditable money movement and explicit trade-offs over production-scale infrastructure.
 
-## What it supports
+## Executive summary
 
-| Requirement | Approach |
+| Assignment requirement | What this implementation does |
 |---|---|
-| Record transfers atomically | `POST /transactions` writes the transaction, ledger entries, and account balances in one database transaction. A failure rolls back the operation. |
-| Query balances and history | `GET /accounts/{id}` returns the current balance; `GET /accounts/{id}/transactions` returns paginated history ordered by transaction time. |
-| Reject insufficient funds | The source account is locked before checking its balance. Transfers cannot take an account below zero. |
-| Reverse transactions | Reversal posts new entries with debit and credit swapped; it never edits or deletes the original. A reversal is refused if the recipient has already spent the funds. |
-| Prevent duplicate requests | Each money-moving request requires a unique `idempotency_key`. Reusing one returns `409` rather than posting again. |
-| Reconcile balances | `GET /reconciliation/month-end` compares stored balances to ledger entries and checks that balances net to zero per currency. |
-| Transfer between currencies | USD and SGD are supported. A cross-currency transfer uses a fetched Frankfurter rate and records the rate used. If the rate is unavailable, the request fails without posting. |
-| Handle concurrent requests | PostgreSQL row locks protect balances; rows are locked in a consistent order to reduce deadlocks. PostgreSQL-specific tests exercise races and rounding. |
+| Record transactions atomically | `POST /transactions` records ledger entries and updates both balances in one database transaction. |
+| Query balances and history | `GET /accounts/{id}` returns a balance; `GET /accounts/{id}/transactions` returns paginated, timestamp-ordered history. |
+| Reject overdrafts | Locks the source account and checks its current PostgreSQL balance before posting. |
+| Prevent duplicate transfers | Requires an `idempotency_key`; reusing a key returns `409` and does not post again. |
+| Reverse transactions | Posts a new transaction with the original entries reversed; never edits or deletes ledger history. |
+| Reconcile the ledger | Compares stored balances with entries and checks that balances net to zero per currency. |
+| Support multiple currencies | USD and SGD transfers use a fetched reference rate; the rate is saved with the transaction. |
+| Handle concurrent requests | PostgreSQL row locks and deterministic lock ordering protect shared balances; dedicated PostgreSQL tests exercise races. |
 
-## Ledger design
+**Core design:** immutable double-entry ledger entries are the audit trail; account balances are maintained as a fast, transactionally updated copy. Deposits and withdrawals use `EXTERNAL`; cross-currency transfers use `FX_POSITION` so each currency balances independently.
 
-Every movement creates balanced debit and credit entries. Entries are append-only; corrections are new transactions.
+**Try it:** copy `.env.example` to `.env`, set a local-only `POSTGRES_PASSWORD`, and run `docker compose up --build`. Open `http://localhost:8000/docs` to explore the API. Run the fast suite with `pytest tests/test_ledger_endpoints.py`; CI also runs the PostgreSQL concurrency suite.
 
-- Deposits and withdrawals use an `EXTERNAL` system account.
-- Same-currency transfers create two entries.
-- Cross-currency transfers create four entries through `FX_POSITION`, keeping each currency balanced independently.
-- Amounts use `Decimal` in Python and `NUMERIC(18,2)` in PostgreSQL. API amounts must be positive and have at most two decimal places. Cross-currency transfers have a minimum of 10 source-currency units.
-- The stored account balance is a read optimization; ledger entries remain the audit history.
+The details below are optional for a first pass and explain the ledger rules, failure behavior, and limitations.
 
-## Run locally
+## Technical details
 
-Docker Compose starts PostgreSQL and the API. Copy `.env.example` to `.env`, set a local-only `POSTGRES_PASSWORD`, then run:
+### API
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /accounts` | Create a USD or SGD customer account. |
+| `POST /deposit`, `POST /withdraw` | Move funds between a customer account and `EXTERNAL`. Withdrawals cannot overdraw. |
+| `POST /transactions` | Transfer between customer accounts. Request fields: `from_account_id`, `to_account_id`, `amount`, and unique `idempotency_key`. |
+| `POST /transactions/{id}/reverse` | Reverse a transaction if doing so will not make a customer balance negative. |
+| `GET /accounts/{id}` | Read the current balance and account currency. |
+| `GET /accounts/{id}/transactions` | Read paginated ledger-entry history; supports ascending or descending timestamp order. |
+| `GET /reconciliation/month-end?month=YYYY-MM` | Read the reconciliation report. |
+
+### Ledger and money rules
+
+- Every movement is double-entry: debits equal credits within each currency. Same-currency transfers create two entries; a currency conversion creates four, passing through `FX_POSITION`.
+- Example: transferring 40 USD to SGD at 1.35 debits the sender and credits `FX_POSITION` by 40 USD, then debits `FX_POSITION` and credits the recipient by 54 SGD. A reversal swaps those four entries using the original amounts.
+- Python uses `Decimal`; PostgreSQL stores amounts as `NUMERIC(18,2)`. Amounts must be positive, fit that range, and have no more than two decimal places. Responses format amounts as decimal strings.
+- Transfer amount is in the source currency. Cross-currency transfers have a minimum of 10 source-currency units. The Frankfurter daily reference rate is rounded to six decimal places; the converted amount is rounded once to cents using `ROUND_HALF_UP`.
+- FX is fail-closed: a timeout, invalid response, or unavailable rate returns `503` without recording a transaction. The exact rate used is stored on the transaction; later rate changes do not alter history. This is a reference rate, not a guaranteed live market quote.
+- A reversal copies the original amounts and swaps each debit and credit, including for FX transfers. It never makes a new rate request. If the recipient has already spent the funds, reversal is refused; a real dispute workflow is outside this project.
+- Entries are append-only. A correction is another transaction, not an edit to existing history. The `accounts.balance` value is updated in the same commit as the entries, but money-moving decisions read the locked database row, never a cache.
+
+### Concurrency and idempotency
+
+The source and destination account rows are locked in ascending ID order before balances are checked or changed. FX rates are fetched before acquiring those locks, so a slow external service does not hold account locks. System accounts are locked after customer accounts in a consistent order. Unique database constraints backstop the idempotency check and prevent a transaction from being reversed twice, including under races.
+
+### Reconciliation
+
+The report checks each account's stored balance against its credits minus debits, then checks that customer, `EXTERNAL`, and `FX_POSITION` balances net to zero for each currency. Both checks use one SQL statement for a consistent snapshot. The endpoint returns `200` with `RECONCILED` or `OUT_OF_BALANCE`; invalid months return `400`.
+
+The `month` parameter groups monthly activity, but there are no saved month-end snapshots: balances are live, so a past close cannot be reproduced after later transactions. Reconciliation also does not verify each transaction's internal balance, confirm that the FX rate was commercially correct, or compare the ledger against an external bank statement.
+
+### Run and test
+
+**Start the API and PostgreSQL with Docker Compose:**
 
 ```sh
 docker compose up --build
 ```
 
-The API docs are available at `http://localhost:8000/docs`. To create an account:
+Before starting, copy `.env.example` to `.env` and set `POSTGRES_PASSWORD` to a local-only, URL-safe value.
 
-```sh
-curl -X POST http://localhost:8000/accounts \
-  -H "Content-Type: application/json" \
-  -d '{"owner_name":"Alice","currency":"USD"}'
-```
-
-Use the returned account IDs for deposits, transfers, balance lookups, and history. Transfer requests include an idempotency key:
+Create an account through `POST /accounts`, then use its returned ID in a transfer request such as:
 
 ```json
 {
@@ -52,28 +76,27 @@ Use the returned account IDs for deposits, transfers, balance lookups, and histo
 }
 ```
 
-Submit this body to `POST /transactions`. For local development without Docker, run PostgreSQL separately, configure `DATABASE_URL`, create the schema/system accounts with `python -m app.create_table`, then start `uvicorn app.main:app --reload`.
+Send the request to `POST /transactions`. Swagger UI at `/docs` provides an interactive way to try all endpoints.
 
-## Verify
-
-The endpoint suite uses a temporary SQLite database:
+**Endpoint and business-rule tests** use a temporary SQLite database:
 
 ```sh
 pytest tests/test_ledger_endpoints.py
 ```
 
-The concurrency and rounding suite needs PostgreSQL and an **empty, disposable** database; it drops and recreates its tables:
+**Concurrency and rounding tests** require PostgreSQL because SQLite does not enforce PostgreSQL row locks or its numeric rounding behavior. CI provisions a PostgreSQL service and runs this suite separately. To run it locally, point `TEST_POSTGRES_URL` at an **empty, disposable** PostgreSQL database; the tests drop and recreate its tables:
 
 ```sh
 TEST_POSTGRES_URL=postgresql+psycopg://postgres:your-password@localhost:5432/ledger_test \
   pytest tests/test_postgres_concurrency.py
 ```
 
-SQLite does not enforce PostgreSQL row locks, so it is not a substitute for the second suite. CI provisions PostgreSQL and runs both suites, followed by a Docker API smoke test.
+CI runs both test suites on pushes to `main`, pull requests, and manual dispatch, then builds the Compose stack and runs an API smoke test. Its deploy job is illustrative only and does not deploy the application.
 
-## Scope and trade-offs
+### Scope and trade-offs
 
-- Supported currencies are USD and SGD. FX uses a daily reference rate, not a guaranteed live market quote; there is no quote-and-confirm flow or spread.
-- Reconciliation reports current stored balances and monthly activity, not a saved historical close. It cannot compare against an external bank statement or prove that an FX rate was commercially correct.
-- Authentication, authorization, migrations, and production secret management are outside this take-home. `.env` is local-only and ignored by Git; deployments should inject secrets through their platform.
-- The CI deploy step is illustrative only; it does not deploy the application.
+- Supports USD and SGD only, with one fixed currency per account. Adding currencies requires currency-specific precision and system accounts.
+- No FX quote-and-confirm step, spread, or fee. The customer accepts the rate at execution.
+- No authentication or authorization; do not expose this demo API publicly.
+- No saved historical reconciliation snapshots, external bank-statement reconciliation, migrations, or production secret management. Local `.env` files are ignored by Git; deployments should inject secrets through their platform.
+- Docker Compose is a convenient local environment, not a production deployment architecture.
