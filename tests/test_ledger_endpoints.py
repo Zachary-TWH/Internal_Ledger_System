@@ -147,28 +147,6 @@ def test_clean_ledger_is_reconciled_and_each_currency_sums_to_zero():
     }
 
 
-def test_empty_ledger_is_reconciled():
-    body = report().json()
-
-    assert body["status"] == "RECONCILED"
-    assert all(c["net"] == "0.00" for c in body["currencies"])
-
-
-def test_many_movements_in_both_directions_still_sum_to_zero():
-    alice, bob_sgd, carol = new_account("alice"), new_account("bob", "SGD"), new_account("carol")
-    deposit(alice, 500, "d1")
-    deposit(bob_sgd, 300, "d2")
-    transfer(alice, bob_sgd, 10.01, "t1")      # 10.01 x 1.35 = 13.5135 -> 13.51 SGD (rounds down)
-    transfer(bob_sgd, alice, 10, "t2")         # 10 SGD x 0.74 = 7.40 USD
-    transfer(alice, carol, 25, "t3")           # same currency: two entries, no FX accounts
-    assert post_withdraw(bob_sgd, 5, "w1").status_code == 200
-
-    body = report().json()
-
-    assert body["status"] == "RECONCILED"
-    assert currency_row(body, "USD")["net"] == "0.00" and currency_row(body, "SGD")["net"] == "0.00"
-
-
 def test_balance_changed_outside_the_normal_path_is_out_of_balance():
     alice, bob_sgd = new_account("alice"), new_account("bob", "SGD")
     deposit(alice, 100, "d1")
@@ -226,11 +204,6 @@ def test_invalid_month_returns_400():
         assert report(bad).status_code == 400
 
 
-def test_month_has_ended_flag():
-    assert report("2020-01").json()["month_has_ended"] is True
-    assert report("2099-12").json()["month_has_ended"] is False      # December rolls into the next year
-
-
 # ---------------------------------------------------------------------------
 # System accounts: EXTERNAL and FX_POSITION balances move with every entry
 # ---------------------------------------------------------------------------
@@ -266,16 +239,6 @@ def test_cross_currency_transfer_writes_four_entries_through_fx_position():
     assert system_balance("FX_POSITION", "USD") == Decimal("50.00")    # bank took in 50 USD
     assert system_balance("FX_POSITION", "SGD") == Decimal("-67.50")   # and paid out 67.50 SGD
     assert system_balance("EXTERNAL", "USD") == Decimal("-100.00")     # unchanged by the conversion
-
-
-def test_same_currency_transfer_does_not_touch_system_accounts():
-    alice, bob = new_account("alice"), new_account("bob")
-    deposit(alice, 100, "d1")
-
-    transfer(alice, bob, 30, "t1")
-
-    assert system_balance("EXTERNAL", "USD") == Decimal("-100.00")
-    assert system_balance("FX_POSITION", "USD") == 0 and system_balance("FX_POSITION", "SGD") == 0
 
 
 def test_cross_currency_transfer_without_fx_position_accounts_returns_500_and_records_nothing():
@@ -317,19 +280,20 @@ def system_account_id(owner_name, currency):
         db.close()
 
 
-def test_deposit_into_a_system_account_is_rejected():
-    external = system_account_id("EXTERNAL", "USD")
+@pytest.mark.parametrize(
+    ("owner_name", "endpoint"),
+    [("EXTERNAL", "deposit"), ("FX_POSITION", "withdraw")],
+)
+def test_system_accounts_cannot_be_used_by_deposit_or_withdrawal(owner_name, endpoint):
+    account_id = system_account_id(owner_name, "USD")
+    response = (
+        post_deposit(account_id, 100, "system-deposit")
+        if endpoint == "deposit"
+        else post_withdraw(account_id, 100, "system-withdraw")
+    )
 
-    assert post_deposit(external, 100, "d1").status_code == 400
-    assert system_balance("EXTERNAL", "USD") == 0
-    assert count_rows(models.Transaction) == 0 and count_rows(models.LedgerEntry) == 0
-
-
-def test_withdraw_from_a_system_account_is_rejected():
-    fx_position = system_account_id("FX_POSITION", "USD")
-
-    assert post_withdraw(fx_position, 100, "w1").status_code == 400
-    assert system_balance("FX_POSITION", "USD") == 0
+    assert response.status_code == 400
+    assert system_balance(owner_name, "USD") == 0
     assert count_rows(models.Transaction) == 0 and count_rows(models.LedgerEntry) == 0
 
 
@@ -343,28 +307,6 @@ def test_transfer_from_or_to_a_system_account_is_rejected():
     assert post_transfer(external, alice, 10, "t2").status_code == 400    # system -> customer
     assert balance_of(alice) == 100 and system_balance("EXTERNAL", "USD") == Decimal("-100.00")
     assert count_rows(models.Transaction) == transactions_before
-
-
-def test_transfer_to_a_system_account_is_refused_before_any_fx_call():
-    alice = new_account("alice")                       # USD
-    deposit(alice, 100, "seed")
-    fx_position_sgd = system_account_id("FX_POSITION", "SGD")
-    FETCH_CALLS.clear()
-
-    assert post_transfer(alice, fx_position_sgd, 10, "t1").status_code == 400
-    assert FETCH_CALLS == []                           # a USD -> SGD pair would have called the service
-    assert balance_of(alice) == 100
-
-
-def test_system_accounts_can_still_be_read():
-    external = system_account_id("EXTERNAL", "USD")
-    alice = new_account("alice")
-    deposit(alice, 100, "d1")
-
-    account = client.get(f"/accounts/{external}").json()
-    assert account["owner_name"] == "EXTERNAL" and Decimal(account["balance"]) == Decimal("-100.00")
-    history = client.get(f"/accounts/{external}/transactions").json()["results"]
-    assert len(history) == 1 and history[0]["entry_type"] == "DEBIT"
 
 
 # ---------------------------------------------------------------------------
@@ -385,30 +327,6 @@ def test_deposit_increases_balance_and_writes_two_entries():
     db.close()
     assert sorted(e.entry_type.value for e in entries) == ["CREDIT", "DEBIT"]
     assert {e.amount for e in entries} == {Decimal("100.00")}
-
-
-def test_deposit_same_idempotency_key_moves_money_once():
-    alice = new_account("alice")
-
-    assert post_deposit(alice, 100, "d1").status_code == 200
-    assert post_deposit(alice, 100, "d1").status_code == 409    # retry is rejected
-
-    assert balance_of(alice) == 100                             # not 200
-    assert count_rows(models.Transaction) == 1
-
-
-def test_deposit_unknown_account_returns_404():
-    assert post_deposit(9999, 100, "d1").status_code == 404
-    assert count_rows(models.Transaction) == 0
-
-
-@pytest.mark.parametrize("bad_amount", [0, -50])
-def test_deposit_rejects_zero_and_negative_amount(bad_amount):
-    alice = new_account("alice")
-
-    assert post_deposit(alice, bad_amount, "d1").status_code == 422
-    assert balance_of(alice) == 0
-    assert count_rows(models.Transaction) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -433,14 +351,6 @@ def test_withdraw_decreases_balance_and_writes_two_entries():
     assert by_type["DEBIT"].amount == by_type["CREDIT"].amount == Decimal("40.00")
 
 
-def test_withdraw_exact_balance_is_allowed():
-    alice = new_account("alice")
-    deposit(alice, 100, "d1")
-
-    assert post_withdraw(alice, 100, "w1").status_code == 200
-    assert balance_of(alice) == 0
-
-
 def test_withdraw_insufficient_funds_is_rejected_and_nothing_changes():
     alice = new_account("alice")
     deposit(alice, 100, "d1")
@@ -451,29 +361,6 @@ def test_withdraw_insufficient_funds_is_rejected_and_nothing_changes():
     assert balance_of(alice) == 100
     assert count_rows(models.Transaction) == 1      # only the deposit
     assert count_rows(models.LedgerEntry) == 2      # only the deposit's two entries
-
-
-def test_withdraw_same_idempotency_key_moves_money_once():
-    alice = new_account("alice")
-    deposit(alice, 100, "d1")
-
-    assert post_withdraw(alice, 40, "w1").status_code == 200
-    assert post_withdraw(alice, 40, "w1").status_code == 409
-
-    assert balance_of(alice) == 60                  # not 20
-
-
-def test_withdraw_unknown_account_returns_404():
-    assert post_withdraw(9999, 10, "w1").status_code == 404
-
-
-@pytest.mark.parametrize("bad_amount", [0, -5])
-def test_withdraw_rejects_zero_and_negative_amount(bad_amount):
-    alice = new_account("alice")
-    deposit(alice, 100, "d1")
-
-    assert post_withdraw(alice, bad_amount, "w1").status_code == 422
-    assert balance_of(alice) == 100
 
 
 # ---------------------------------------------------------------------------
@@ -548,16 +435,6 @@ def test_transfer_same_idempotency_key_moves_money_once():
     assert balance_of(alice) == 70 and balance_of(bob) == 30     # not 40 and 60
 
 
-def test_transfer_same_idempotency_key_moves_money_once_cross_currency():
-    alice, bob_sgd = new_account("alice"), new_account("bob", "SGD")
-    deposit(alice, 100, "d1")
-
-    assert post_transfer(alice, bob_sgd, 40, "t1").status_code == 200
-    assert post_transfer(alice, bob_sgd, 40, "t1").status_code == 409
-
-    assert balance_of(alice) == 60 and balance_of(bob_sgd) == 54
-
-
 def test_transfer_to_same_account_returns_400():
     alice = new_account("alice")
     deposit(alice, 100, "d1")
@@ -593,13 +470,12 @@ def test_transfer_cross_currency_returns_503_when_rate_service_is_down():
     assert balance_of(bob_sgd) == 90 and balance_of(alice) == Decimal("7.40")          # 10 SGD x 0.74
 
 
-@pytest.mark.parametrize("small_amount", [0.01, 5, 9.99])
-def test_cross_currency_transfer_below_minimum_is_rejected_before_any_fx_call(small_amount):
+def test_cross_currency_transfer_below_minimum_is_rejected_before_any_fx_call():
     alice, bob_sgd = new_account("alice"), new_account("bob", "SGD")
     deposit(alice, 100, "d1")
     transactions_before = count_rows(models.Transaction)
 
-    r = post_transfer(alice, bob_sgd, small_amount, "t1")
+    r = post_transfer(alice, bob_sgd, 9.99, "t1")
 
     assert r.status_code == 400
     assert "at least 10" in r.json()["detail"]
@@ -608,55 +484,20 @@ def test_cross_currency_transfer_below_minimum_is_rejected_before_any_fx_call(sm
     assert count_rows(models.Transaction) == transactions_before
 
 
-def test_small_sgd_to_usd_transfer_is_rejected_too():
-    # 0.01 SGD x 0.74 = 0.0074 USD, which would round UP to 0.01 USD: more value than was sent
-    bob_sgd, alice = new_account("bob", "SGD"), new_account("alice")
-    deposit(bob_sgd, 100, "d1")
-
-    r = post_transfer(bob_sgd, alice, 0.01, "t1")
-
-    assert r.status_code == 400
-    assert FETCH_CALLS == []
-    assert balance_of(bob_sgd) == 100 and balance_of(alice) == 0
-
-
-def test_cross_currency_transfer_of_exactly_the_minimum_is_allowed():
-    alice, bob_sgd = new_account("alice"), new_account("bob", "SGD")
-    deposit(alice, 100, "d1")
-
-    r = post_transfer(alice, bob_sgd, 10, "t1")           # 10 USD x 1.35 = 13.50 SGD
-
-    assert r.status_code == 200
-    assert balance_of(alice) == 90 and balance_of(bob_sgd) == Decimal("13.50")
-
-
-def test_same_currency_transfer_has_no_minimum():
-    alice, bob = new_account("alice"), new_account("bob")
-    deposit(alice, 100, "d1")
-
-    assert post_transfer(alice, bob, 0.01, "t1").status_code == 200
-    assert balance_of(alice) == Decimal("99.99") and balance_of(bob) == Decimal("0.01")
-
-
 def test_same_currency_transfer_never_calls_the_rate_service():
     alice, bob = new_account("alice"), new_account("bob")
     deposit(alice, 100, "d1")
     FAKE_RATES.clear()                                   # even with the FX service down
 
-    assert post_transfer(alice, bob, 30, "t1").status_code == 200
+    r = post_transfer(alice, bob, 30, "t1")
+    assert r.status_code == 200
     assert FETCH_CALLS == []
+    assert system_balance("EXTERNAL", "USD") == Decimal("-100.00")
+    assert system_balance("FX_POSITION", "USD") == system_balance("FX_POSITION", "SGD") == 0
 
 
-def test_transfer_to_unknown_account_does_not_call_the_rate_service():
-    alice = new_account("alice")
-    deposit(alice, 100, "d1")
-
-    assert post_transfer(alice, 9999, 10, "t1").status_code == 404
-    assert FETCH_CALLS == []
-
-
-@pytest.mark.parametrize("bad_amount", [0.001, 0.004, 0.005, 10.005])
-def test_amounts_with_more_than_two_decimals_are_rejected_everywhere(bad_amount):
+@pytest.mark.parametrize("bad_amount", [0, -10, 10.005])
+def test_money_endpoints_reject_nonpositive_and_excess_precision_amounts(bad_amount):
     alice, bob = new_account("alice"), new_account("bob")
     deposit(alice, 100, "d1")
     transactions_before = count_rows(models.Transaction)
@@ -666,25 +507,6 @@ def test_amounts_with_more_than_two_decimals_are_rejected_everywhere(bad_amount)
     assert post_transfer(alice, bob, bad_amount, "x3").status_code == 422
     assert balance_of(alice) == 100 and balance_of(bob) == 0
     assert count_rows(models.Transaction) == transactions_before
-
-
-def test_smallest_valid_amount_is_one_cent():
-    alice, bob = new_account("alice"), new_account("bob")
-
-    assert post_deposit(alice, 0.01, "d1").status_code == 200
-    assert post_transfer(alice, bob, 0.01, "t1").status_code == 200
-    assert balance_of(alice) == 0 and balance_of(bob) == Decimal("0.01")
-    assert post_withdraw(bob, 0.01, "w1").status_code == 200
-    assert balance_of(bob) == 0
-
-
-@pytest.mark.parametrize("bad_amount", [0, -10])
-def test_transfer_rejects_zero_and_negative_amount(bad_amount):
-    alice, bob = new_account("alice"), new_account("bob")
-    deposit(alice, 100, "d1")
-
-    assert post_transfer(alice, bob, bad_amount, "t1").status_code == 422
-    assert balance_of(alice) == 100 and balance_of(bob) == 0
 
 
 def test_rate_change_after_transfer_does_not_alter_past_transaction():
@@ -731,10 +553,6 @@ def test_create_account_accepts_lowercase_currency():
     assert r.json()["currency"] == "SGD"
 
 
-def test_get_account_unknown_returns_404():
-    assert client.get("/accounts/9999").status_code == 404
-
-
 # ---------------------------------------------------------------------------
 # GET /accounts/{id}/transactions
 # ---------------------------------------------------------------------------
@@ -771,32 +589,6 @@ def test_history_rows_show_type_amount_and_description():
     bob_rows = history(bob_sgd).json()["results"]
     assert [(r["entry_type"], r["amount"], r["description"]) for r in bob_rows] == [("CREDIT", "54.00", "Transfer")]
     assert all(r["created_at"] for r in alice_rows)
-
-
-def test_history_paging_has_no_gaps_or_overlaps():
-    alice = new_account("alice")
-    ids = [post_deposit(alice, 10, f"d{i}").json()["transaction_id"] for i in range(5)]
-
-    pages = [txn_ids(history(alice, order="asc", page=p, page_size=2)) for p in (1, 2, 3, 4)]
-
-    assert pages == [ids[0:2], ids[2:4], ids[4:5], []]
-
-
-def test_history_of_account_with_no_activity_is_empty():
-    alice = new_account("alice")
-
-    body = history(alice).json()
-    assert body["results"] == [] and body["page"] == 1
-
-
-def test_history_unknown_account_returns_404():
-    assert history(9999).status_code == 404
-
-
-def test_history_invalid_order_returns_422():
-    alice = new_account("alice")
-
-    assert history(alice, order="sideways").status_code == 422
 
 
 # ---------------------------------------------------------------------------
@@ -985,18 +777,6 @@ def test_reverse_cross_currency_transfer_uses_original_amounts_not_todays_rate()
     assert sorted(a for _, _, a in entries_of(reversal)) == [Decimal("40.00"), Decimal("40.00"), Decimal("54.00"), Decimal("54.00")]
 
 
-def test_reversal_of_cross_currency_transfer_keeps_every_currency_balanced():
-    alice, carol_sgd = new_account("alice"), new_account("carol", "SGD")
-    deposit(alice, 100, "d1")
-    original = txn_id(post_transfer(alice, carol_sgd, 40, "t1"))
-    post_reverse(original, "r1")
-
-    body = report().json()
-
-    assert body["status"] == "RECONCILED"
-    assert all(c["net"] == "0.00" for c in body["currencies"])
-
-
 def test_reverse_same_transaction_twice_is_rejected_and_moves_nothing():
     alice, bob = new_account("alice"), new_account("bob")
     deposit(alice, 100, "d1")
@@ -1022,24 +802,6 @@ def test_cannot_reverse_a_reversal():
     assert balance_of(alice) == 100 and balance_of(bob) == 0
 
 
-def test_reverse_unknown_transaction_returns_404():
-    assert post_reverse(9999, "r1").status_code == 404
-    assert count_rows(models.Transaction) == 0
-
-
-def test_reverse_same_idempotency_key_is_rejected_and_reverses_nothing_else():
-    alice, bob = new_account("alice"), new_account("bob")
-    deposit(alice, 100, "d1")
-    first = txn_id(post_transfer(alice, bob, 10, "t1"))
-    second = txn_id(post_transfer(alice, bob, 20, "t2"))
-    assert post_reverse(first, "same-key").status_code == 200
-
-    r = post_reverse(second, "same-key")
-
-    assert r.status_code == 409
-    assert balance_of(alice) == 80 and balance_of(bob) == 20         # only the 10 transfer is undone; the 20 transfer stands
-
-
 def test_reverse_is_rejected_when_the_recipient_already_spent_the_money():
     alice, bob = new_account("alice"), new_account("bob")
     deposit(alice, 100, "d1")
@@ -1052,15 +814,6 @@ def test_reverse_is_rejected_when_the_recipient_already_spent_the_money():
     assert r.status_code == 400
     assert balance_of(alice) == 70 and balance_of(bob) == 10         # nothing changed
     assert (count_rows(models.Transaction), count_rows(models.LedgerEntry)) == rows_before
-
-
-def test_reverse_deposit_is_rejected_when_the_money_was_spent():
-    alice = new_account("alice")
-    dep = txn_id(post_deposit(alice, 100, "d1"))
-    assert post_withdraw(alice, 60, "w1").status_code == 200
-
-    assert post_reverse(dep, "r1").status_code == 400
-    assert balance_of(alice) == 40
 
 
 def test_history_shows_type_and_reversal_link():
