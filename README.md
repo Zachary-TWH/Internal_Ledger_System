@@ -163,8 +163,6 @@ Every write takes a unique `idempotency_key`. Amounts are sent as strings such a
 | `GET /accounts/{id}/transactions` | Ledger entries, `page`, `page_size` (1 to 100), `order` (`asc` or `desc`) | `results` list with `transaction_id`, `type`, `entry_type`, `amount`, `description`, `created_at` |
 | `GET /reconciliation/month-end?month=YYYY-MM` | Read-only two-part reconciliation report | per-currency and per-account results, overall `status` |
 
-`POST /transactions` is the transfer asked for in the brief. The brief does not say how money enters the system, so `/deposit` and `/withdraw` were added for that (behaviour 11).
-
 **Status codes**
 
 | Code | Meaning |
@@ -411,13 +409,13 @@ These are deliberate simplifications. Each one is a gap I know about, with the f
 | Reconciliation compares the ledger with itself | Import the real bank or custodian statement and compare its totals with EXTERNAL |
 | EXTERNAL and FX_POSITION are hot rows, so deposits, withdrawals and conversions in one currency run one after another | Split each system account into several sub-accounts and sum them |
 | Exchange rate is a daily ECB reference rate from a free service, with no quote step, fallback or age check | A paid quote feed, a short-lived quote the transfer must reference, a second provider, and rejection of rates older than an agreed limit (behaviour 7) |
-| A reversal is refused when the recipient already spent the money | A dispute or compensating-transfer process |
+| A reversal is refused when the recipient has already spent the money, because reversing it would overdraw their account | Open a dispute, freeze any remaining funds, and seek repayment through an authorized recovery process. Record any unrecovered amount as a receivable or loss instead of silently making the account negative |
 | No authentication or ownership checks | Authenticate callers and check that they own the source account |
 | `created_at` has no timezone and uses the database server clock | `timestamptz`, stored in UTC |
-| Customer balance cannot go below zero, and every transaction's entries balance, but only the application enforces both | A `CHECK (balance >= 0 OR is_system)` constraint, and a deferred constraint trigger that checks debits equal credits per transaction and currency |
+| The application prevents customer balances from going below zero and posts balanced entries, but the database does not enforce these invariants | Add a `CHECK (balance >= 0 OR is_system)` constraint and a deferred constraint trigger that checks debits equal credits per transaction and currency |
 | Tables come from `create_all`, which never alters an existing table | Schema migrations with Alembic |
-| History uses page numbers, so a new entry arriving between page requests shifts the pages | Keyset pagination on (`created_at`, entry id) |
 | Only USD and SGD | Currency metadata (decimal places, rounding) and system accounts per new currency (behaviour 2) |
+| Repeated reads of popular balances or transaction histories can add substantial database load | Cache read-only display data in Redis with a short expiry and invalidate affected entries after writes. Always read balances from PostgreSQL under a row lock when processing money |
 
 **How I would test the main fixes**
 - **Idempotent replay:** send the same request twice, expect the same body and one transaction. Send it with a different amount, expect a 422.
@@ -427,7 +425,7 @@ These are deliberate simplifications. Each one is a gap I know about, with the f
 
 ### Caching (not implemented)
 
-Caching is **not implemented**; it would add complexity without a clear benefit at this scale. If read load grows:
+Caching is **not implemented**. It could substantially reduce database load for repeated reads of popular balances and transaction histories, but adds invalidation complexity and can briefly show stale data. If measured read load justifies it:
 
 - Cache account balances and transaction history in Redis with a short expiry, and invalidate the affected account's cache after a successful write.
 - Treat cached balances as display-only. Deposits, withdrawals and transfers must always check the current balance from PostgreSQL under a row lock, so stale cache data can never authorize a payment.
