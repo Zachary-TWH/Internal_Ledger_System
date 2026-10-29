@@ -264,12 +264,12 @@ Each item below is a rule the ledger follows. Examples use made-up numbers.
 - Trade-off: every deposit and withdrawal in a currency locks that currency's single EXTERNAL row, and every cross-currency transfer locks both FX_POSITION rows. Those requests run one after another, even for different customers. That is fine at this scale. A fix would be to split each system account into several sub-accounts and sum them.
 
 **11. Idempotency keys are required on every write.**
-- `POST /transactions` is the transfer: source, destination, amount. The spec does not say how money enters the system, so `POST /deposit` and `POST /withdraw` fund and drain accounts through the EXTERNAL account.
-- Deposit, withdrawal and transfer all take an `idempotency_key`.
-- A unique constraint on the key is the final guard.
+- `POST /transactions` is the transfer: source, destination, and amount. `POST /deposit` and `POST /withdraw` fund and drain accounts through the EXTERNAL account.
+- Deposit, withdrawal, reversal and transfer all take an `idempotency_key`.
+- The key is saved on the transaction. The database column has a unique constraint, a rule that no two rows can hold the same key.
 - A reused key returns 409 and moves no money.
 - Example: a client retries `transfer-001` after a timeout. The second call is rejected, so the money moves once.
-- Two identical requests arriving at the same moment can both pass the up-front check. The unique constraint then rejects the loser, and the API turns that into the same clean 409 (never a 500). `test_identical_simultaneous_requests_move_money_once` checks exactly one 200 and nine 409s.
+- Two identical requests arriving at the same moment can both pass the up-front check. The unique constraint then rejects the loser, and the API turns that into the same clean 409 (never a 500).
 - Limit: the 409 does not return the original result, and it does not check whether the retry had the same details.
 
 **12. Timestamps use the database server clock.**
