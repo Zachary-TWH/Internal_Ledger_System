@@ -103,10 +103,15 @@ def commit_or_409(db: Session):
         raise HTTPException(status_code=409, detail="Duplicate request")
 
 
-def reject_duplicate_key(db: Session, idempotency_key: str):
-    """Fast-path idempotency check: a key already used gets a 409. The UNIQUE constraint catches races."""
-    if db.query(models.Transaction.id).filter_by(idempotency_key=idempotency_key).first():
-        raise HTTPException(status_code=409, detail="Duplicate request")
+def find_duplicate(db: Session, idempotency_key: str):
+    """Fast-path idempotency check. A key already used returns the original transaction id (HTTP 200)
+    so a retrying client learns its first attempt worked. None means the key is new. The UNIQUE
+    constraint still catches two identical requests that race (they get a 409).
+    """
+    existing = db.query(models.Transaction.id).filter_by(idempotency_key=idempotency_key).first()
+    if existing:
+        return {"transaction_id": existing.id, "status": "already_processed"}
+    return None
 
 
 def lock_system_account(db: Session, owner_name: str, currency: str) -> models.Account:
@@ -239,7 +244,9 @@ def create_account(account: AccountCreate, db: Session = Depends(get_db)):
 @app.post("/deposit")
 def deposit(req: DepositRequest, db: Session = Depends(get_db)):
     """Add money to an account (DEBIT EXTERNAL, CREDIT the user)."""
-    reject_duplicate_key(db, req.idempotency_key)
+    duplicate = find_duplicate(db, req.idempotency_key)
+    if duplicate:
+        return duplicate
 
     account = db.query(models.Account).filter_by(id=req.account_id).with_for_update().first()
     if not account:
@@ -283,7 +290,9 @@ def deposit(req: DepositRequest, db: Session = Depends(get_db)):
 @app.post("/withdraw")
 def withdraw(req: WithdrawalRequest, db: Session = Depends(get_db)):
     """Take money out of an account (DEBIT the user, CREDIT EXTERNAL). No overdraft."""
-    reject_duplicate_key(db, req.idempotency_key)
+    duplicate = find_duplicate(db, req.idempotency_key)
+    if duplicate:
+        return duplicate
 
     account = db.query(models.Account).filter_by(id=req.account_id).with_for_update().first()
     if not account:
@@ -336,7 +345,9 @@ def transfer(req: TransferRequest, db: Session = Depends(get_db)):
     FX_POSITION entries are in README behaviours 7 and 8. Cheap checks run first, before the FX
     call or any lock.
     """
-    reject_duplicate_key(db, req.idempotency_key)
+    duplicate = find_duplicate(db, req.idempotency_key)
+    if duplicate:
+        return duplicate
 
     if req.from_account_id == req.to_account_id:
         raise HTTPException(status_code=400, detail="Cannot transfer to the same account")
@@ -457,7 +468,9 @@ def transfer(req: TransferRequest, db: Session = Depends(get_db)):
 @app.post("/transactions/{transaction_id}/reverse")
 def reverse_transaction(transaction_id: int, req: ReversalRequest, db: Session = Depends(get_db)):
     """Undo a transaction by posting a new REVERSAL transaction (see README "Reversal rules")."""
-    reject_duplicate_key(db, req.idempotency_key)
+    duplicate = find_duplicate(db, req.idempotency_key)
+    if duplicate:
+        return duplicate
 
     # Lock the original transaction's row so two reversals of it run one at a time. Nothing else
     # locks a transaction row, so this cannot deadlock with the account locks taken below.

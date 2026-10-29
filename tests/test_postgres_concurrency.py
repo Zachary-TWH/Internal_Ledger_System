@@ -161,9 +161,12 @@ def test_identical_simultaneous_requests_move_money_once():
 
     responses = run_parallel([lambda: deposit(alice, 50, "same-key") for _ in range(10)])
 
-    # Exactly one request wins. The others are duplicates; the unique constraint on the
-    # idempotency key stops them, and every loser gets a clean 409 (never a 500).
-    assert statuses(responses) == [200] + [409] * 9
+    # Exactly one request creates the transaction. The others are duplicates: those that arrive
+    # after it committed get 200 "already_processed", those that race it are stopped by the unique
+    # key and get 409. Never a 500, and the balance moves once.
+    assert set(statuses(responses)) <= {200, 409}
+    created = [r for r in responses if r.status_code == 200 and "status" not in r.json()]
+    assert len(created) == 1
     assert balance_of(alice) == 50
     db = SessionLocal()
     rows = db.query(models.Transaction).filter_by(idempotency_key="same-key").count()
