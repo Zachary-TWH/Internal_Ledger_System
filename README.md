@@ -163,8 +163,6 @@ Every write takes a unique `idempotency_key`. Amounts are sent as strings such a
 | `GET /accounts/{id}/transactions` | Ledger entries, `page`, `page_size` (1 to 100), `order` (`asc` or `desc`) | `results` list with `transaction_id`, `type`, `entry_type`, `amount`, `description`, `created_at` |
 | `GET /reconciliation/month-end?month=YYYY-MM` | Read-only two-part reconciliation report | per-currency and per-account results, overall `status` |
 
-`POST /transactions` is the transfer asked for in the brief. The brief does not say how money enters the system, so `/deposit` and `/withdraw` were added for that (behaviour 11).
-
 **Status codes**
 
 | Code | Meaning |
@@ -416,22 +414,14 @@ These are deliberate simplifications. Each one is a gap I know about, with the f
 | `created_at` has no timezone and uses the database server clock | `timestamptz`, stored in UTC |
 | Customer balance cannot go below zero, and every transaction's entries balance, but only the application enforces both | A `CHECK (balance >= 0 OR is_system)` constraint, and a deferred constraint trigger that checks debits equal credits per transaction and currency |
 | Tables come from `create_all`, which never alters an existing table | Schema migrations with Alembic |
-| History uses page numbers, so a new entry arriving between page requests shifts the pages | Keyset pagination on (`created_at`, entry id) |
 | Only USD and SGD | Currency metadata (decimal places, rounding) and system accounts per new currency (behaviour 2) |
+| Caching is not implemented; repeated reads of popular balances and transaction histories can significantly increase database load | Cache these reads in Redis with a short expiry and invalidate affected entries after successful writes. Treat cached balances as display-only; money-moving requests must always check PostgreSQL under a row lock |
 
 **How I would test the main fixes**
 - **Idempotent replay:** send the same request twice, expect the same body and one transaction. Send it with a different amount, expect a 422.
 - **Snapshots:** post entries across two months, snapshot the first, change balances in the second, and expect the first month to still sum to 0.00. Edit a snapshot row by hand and expect the check to fail.
 - **Per-transaction check:** insert an unbalanced transaction directly in the database and expect it to be flagged.
 - **Sub-accounts:** run 20 parallel deposits in one currency and compare total time and the summed balance before and after.
-
-### Caching (not implemented)
-
-Caching is **not implemented**; it would add complexity without a clear benefit at this scale. If read load grows:
-
-- Cache account balances and transaction history in Redis with a short expiry, and invalidate the affected account's cache after a successful write.
-- Treat cached balances as display-only. Deposits, withdrawals and transfers must always check the current balance from PostgreSQL under a row lock, so stale cache data can never authorize a payment.
-- Accept that displayed data may briefly be stale; introduce caching only when PostgreSQL read load justifies that trade-off.
 
 ## Running and testing it
 
