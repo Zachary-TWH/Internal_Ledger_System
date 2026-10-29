@@ -106,6 +106,17 @@ Alice (USD, balance 100.00) transfers 30.00 to Bob (USD, balance 0.00):
 7. **Update balances:** Alice 70.00, Bob 30.00.
 8. **Commit.** All of it, or none of it. A duplicate-key clash at the commit becomes a 409 (two identical requests racing).
 
+### Why these design choices
+
+| Choice | Benefit | Trade-off |
+|--------|---------|-----------|
+| Append-only double-entry ledger | Auditable history; mistakes are corrected with new transactions | More rows per movement |
+| Stored account balance | Fast balance reads | Must be reconciled against ledger entries |
+| Unique idempotency key and ordered row locks | Safe retries and concurrent transfers without lost updates or deadlocks | A replay returns only the original transaction ID; system accounts can become hot rows |
+| EXTERNAL and FX_POSITION per currency | Deposits/withdrawals and FX conversions balance by currency | Four shared system accounts for the two supported currencies |
+| Store the executed FX rate with the transaction | Historical conversions do not change when rates move | No quote-and-confirm step |
+| `Decimal` and `NUMERIC(18,2)` | Exact arithmetic for supported currencies | Currency precision is limited to two decimal places |
+
 ## API at a glance
 
 Every write takes a unique `idempotency_key`. Amounts are sent as strings such as `"10.50"` (numbers also work) and come back as 2-decimal strings.
@@ -166,6 +177,7 @@ Each item below is a rule the ledger follows. Examples use made-up numbers.
 
 **8. A cross-currency transfer uses four entries, through FX_POSITION.**
 - Sending 50 USD for 67.50 SGD debits the sender and credits FX_POSITION USD, then debits FX_POSITION SGD and credits the recipient. Each currency balances independently using the same rounded amounts.
+- The destination amount is the source amount multiplied by the fetched rate, rounded once to two decimals using `ROUND_HALF_UP`; both FX legs use that same rounded amount.
 
 **9. Overdrafts are not allowed.**
 - Withdrawals and transfers with insufficient funds return 400; the balance is checked after locking the account.
@@ -176,6 +188,7 @@ Each item below is a rule the ledger follows. Examples use made-up numbers.
 
 **11. Idempotency keys are required on every write.**
 - Every write requires a unique `idempotency_key`. Replays return the original transaction ID with `already_processed` and do not move money; concurrent duplicate requests are protected by the database unique constraint.
+- If identical requests race, one can receive 409; retrying with the same key returns the successful transaction ID.
 - The replay response does not include the full original response or verify that the retry has identical details.
 
 **12. Timestamps use the database server clock.**
@@ -185,11 +198,13 @@ Each item below is a rule the ledger follows. Examples use made-up numbers.
 - Anyone who can reach the API can act on any account; authentication and ownership checks are out of scope.
 
 **14. Minimum amounts.**
-- Same-currency writes accept amounts from 0.01; USD/SGD cross-currency transfers require at least 10 source-currency units to avoid zero or misleading results after rounding. Amounts with more than two decimals return 422.
+- Same-currency writes accept amounts from 0.01; USD/SGD cross-currency transfers require at least 10 source-currency units. Amounts with more than two decimals return 422.
+- The cross-currency minimum avoids conversions rounding to 0.00 or materially changing the converted amount through rounding. For example, 0.01 SGD at 0.74 converts to 0.0074 USD, which rounds up to 0.01 USD.
 
 **15. Month-end reconciliation compares every balance with the ledger.**
 - `GET /reconciliation/month-end?month=YYYY-MM` checks stored balances against each account's credits minus debits, and verifies that balances sum to zero per currency. The response is read-only and returns `RECONCILED` or `OUT_OF_BALANCE` (HTTP 200); invalid months return 400.
-- All checks use one database snapshot, but balances are live: past months cannot be reproduced, and each call scans the ledger history. It also cannot detect off-ledger discrepancies or confirm each transaction's entries and exchange rate.
+- For example, credits of 100 and debits of 40 give a ledger balance of 60; a stored balance of 70 is a mismatch of 10. System accounts are included in both checks.
+- The report reads all balances and entries in one SQL statement, so concurrent commits cannot produce a mixed snapshot. However, balances are live: past months cannot be reproduced, and each call scans the ledger history. It cannot detect off-ledger discrepancies or confirm each transaction's entries and exchange rate; correct discrepancies with a new auditable transaction.
 
 **16. Every write is atomic: all of it is saved, or none of it.**
 - Account creation, deposits, withdrawals, transfers and reversals each commit once. Failures before commit roll back the transaction, entries and balance updates together.
@@ -249,6 +264,14 @@ This walkthrough follows one example through the three tables. Account IDs assum
 | 5 reversal | -80 | 0 | 0 | 50 | 30 | 0 |
 
 The entries show the core rules: the FX transfer balances each currency through FX_POSITION, and its reversal swaps the original debit/credit directions using the original amounts and rate. Transactions and entries remain append-only; each transaction can be reversed at most once, and reversal is refused if it would overdraw an account.
+
+| Reversal request | Result |
+|------------------|--------|
+| Reverse transaction 4 | 200; creates transaction 5 |
+| Reverse transaction 4 again | 409; `reversal_of` is unique |
+| Reverse transaction 5 (it is already a reversal) | 400 |
+| Reverse a deposit after the recipient has spent the funds | 400; the reversal would overdraw the account |
+| Reverse a nonexistent transaction | 404 |
 
 ## Known limitations and how I would solve them
 
