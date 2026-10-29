@@ -257,7 +257,7 @@ Each item below is a rule the ledger follows. Examples use made-up numbers.
 - The check happens after the account row is locked, so it reads the latest balance.
 
 **10. Concurrent requests are serialised per account.**
-- Accounts are loaded with `SELECT ... FOR UPDATE`.
+- In the Python code, SQLAlchemy's `.with_for_update()` adds a row lock to the query; PostgreSQL executes it as `SELECT ... FOR UPDATE`. The request waits if another transaction already holds a lock on that account, then checks the latest committed balance.
 - A transfer locks both accounts in ascending ID order.
 - Example: A to B and B to A at the same time both lock the lower ID first, so they cannot deadlock.
 - System accounts are locked too, always after the customer rows and, for the two FX_POSITION rows, in ascending ID order. Every request therefore takes its locks in the same order and cannot deadlock.
@@ -426,31 +426,11 @@ These are deliberate simplifications. Each one is a gap I know about, with the f
 
 ### Caching (not implemented)
 
-Balance and history reads are a good fit for caching. This is **not implemented** to keep the ledger simple.
+Caching is **not implemented**; it would add complexity without a clear benefit at this scale. If read load grows:
 
-**1. What would be cached.**
-- `GET /accounts/{id}` and `GET /accounts/{id}/transactions`.
-- These are read far more often than they change.
-
-**2. Where.**
-- Redis, with a short expiry (for example 5 seconds).
-- Example key: `balance:42`.
-
-**3. How it stays fresh.**
-- **Step 1:** first read of account 42 misses the cache, reads Postgres, stores `balance:42 = 100.00`.
-- **Step 2:** a deposit of 50 on account 42 commits.
-- **Step 3:** the app deletes `balance:42`.
-- **Step 4:** the next read misses, reads 150.00 from Postgres, stores it again.
-
-**4. Money-moving code never reads the cache.**
-- Scenario: the cache says 100.00, the real balance is 20.00, and a withdrawal of 80 arrives.
-- **Wrong:** read 100.00 from the cache, allow the withdrawal, overdraw the account by 60.
-- **Correct:** lock the row and read 20.00 from Postgres, reject with "Insufficient funds".
-- So a stale cache can never cause an overdraft.
-
-**5. Trade-off.**
-- A displayed balance can be a few seconds out of date.
-- At this scale Postgres handles the read load, so the extra moving part is not worth it yet.
+- Cache account balances and transaction history in Redis with a short expiry, and invalidate the affected account's cache after a successful write.
+- Treat cached balances as display-only. Deposits, withdrawals and transfers must always check the current balance from PostgreSQL under a row lock, so stale cache data can never authorize a payment.
+- Accept that displayed data may briefly be stale; introduce caching only when PostgreSQL read load justifies that trade-off.
 
 ## Running and testing it
 
