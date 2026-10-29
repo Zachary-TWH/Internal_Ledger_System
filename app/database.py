@@ -4,7 +4,7 @@ The connection string comes from the DATABASE_URL environment variable (a local 
 if present; variables already set in the environment win, which is how docker-compose and the
 tests point the app at another database), e.g.
     postgresql://postgres:<password>@localhost:5432/ledger
-Postgres is the intended database (row locks, README assumption 10).
+Postgres is the intended database (row locks, README behaviour 10).
 """
 
 import os

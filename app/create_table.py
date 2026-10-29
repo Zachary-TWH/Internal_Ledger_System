@@ -15,7 +15,7 @@ from . import models
 
 SYSTEM_CURRENCIES = ["SGD", "USD"]
 
-# One of each per supported currency (README assumption 6).
+# One of each per supported currency (README behaviour 6).
 SYSTEM_ACCOUNT_NAMES = ["EXTERNAL", "FX_POSITION"]
 
 

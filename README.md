@@ -20,26 +20,19 @@ The core idea: **every movement is a transaction made of balanced DEBIT and CRED
 2. [API at a glance](#api-at-a-glance)
 3. [Requirements checklist](#requirements-checklist)
 4. [How it works](#how-it-works)
-5. [Assumptions](#assumptions)
+5. [Behaviour](#behaviour)
 6. [Walkthrough](#walkthrough-deposit-withdraw-transfer-and-reversal)
-7. [Month-end reconciliation](#month-end-reconciliation-implemented)
-8. [Known limitations and how I would solve them](#known-limitations-and-how-i-would-solve-them)
-9. [Caching (not implemented)](#caching-not-implemented)
-10. [Tests and CI](#tests-and-ci)
-11. [Project layout](#project-layout)
-12. [Local configuration](#local-configuration)
+7. [Known limitations and how I would solve them](#known-limitations-and-how-i-would-solve-them)
+8. [Caching (not implemented)](#caching-not-implemented)
+9. [Tests and CI](#tests-and-ci)
+10. [Project layout](#project-layout)
+11. [Local configuration](#local-configuration)
 
 ## Quick start
 
 **Needs:** Docker with Compose. Cross-currency transfers also need internet access, because the exchange rate comes from the Frankfurter API (without it they return 503, everything else still works).
 
-**1. Create a `.env` file** in the repository root. It is not committed. Any password works for local use:
-
-```
-POSTGRES_PASSWORD=dev-password
-```
-
-**2. Start the stack:**
+**1. Start the stack.** The repository includes a `.env` with a demo database password (see [Local configuration](#local-configuration)), so there is nothing to set up first.
 
 ```
 docker compose up --build
@@ -47,7 +40,7 @@ docker compose up --build
 
 This starts PostgreSQL and the API. On start-up the API creates the tables and the 4 system accounts (safe to re-run). The API is at `http://localhost:8000`, and interactive docs are at `http://localhost:8000/docs`.
 
-**3. Try it.** On a fresh database, ids 1 to 4 are the system accounts, so the first customer account is 5.
+**2. Try it.** On a fresh database, ids 1 to 4 are the system accounts, so the first customer account is 5.
 
 ```
 # Alice (USD, id 5), Bob (USD, id 6), Carol (SGD, id 7)
@@ -98,7 +91,7 @@ Every write takes a unique `idempotency_key`. Amounts are sent as strings such a
 | `GET /accounts/{id}/transactions` | Ledger entries, `page`, `page_size` (1 to 100), `order` (`asc` or `desc`) | `results` list with `transaction_id`, `type`, `entry_type`, `amount`, `description`, `created_at` |
 | `GET /reconciliation/month-end?month=YYYY-MM` | Read-only two-part reconciliation report | per-currency and per-account results, overall `status` |
 
-`POST /transactions` is the transfer asked for in the brief. The brief does not say how money enters the system, so `/deposit` and `/withdraw` were added for that (assumption 11).
+`POST /transactions` is the transfer asked for in the brief. The brief does not say how money enters the system, so `/deposit` and `/withdraw` were added for that (behaviour 11).
 
 **Status codes**
 
@@ -118,17 +111,17 @@ Where each item of the assignment is covered.
 
 | Requirement | Status | Where |
 |-------------|--------|-------|
-| `POST /transactions` with source, destination, amount, recorded atomically, returns transaction id | Done | API table above, assumption 4 |
+| `POST /transactions` with source, destination, amount, recorded atomically, returns transaction id | Done | API table above, behaviour 4 |
 | `GET /accounts/{id}` returns the current balance | Done | API table above |
 | `GET /accounts/{id}/transactions` returns history ordered by timestamp | Done | Newest first by default, `order=asc` for oldest first. Ties broken by entry id so pages never overlap |
-| Transfer is one atomic operation, rejected on insufficient balance | Done | Assumptions 4 and 9 |
+| Transfer is one atomic operation, rejected on insufficient balance | Done | Behaviours 4 and 9 |
 | Transactions can be reversed (posted as a reversal) | Done | Walkthrough, "Reversal rules" |
-| Repeated submission does not cause extra transfers | Done | Assumption 11 |
-| Verify total money in the ledger matches the expected sum, report discrepancies | Done | Month-end reconciliation, check 2 |
-| Transactions between different currencies using exchange rates | Done | Assumptions 7 and 8 |
-| Simultaneous transfers to the same account are safe | Done | Assumption 10, Postgres concurrency tests |
-| Month-end reconciliation of accounts against transaction history | Done, with a limit: it reads live balances | Month-end reconciliation, check 1 |
-| Document assumptions | Done | Assumptions 1 to 14 |
+| Repeated submission does not cause extra transfers | Done | Behaviour 11 |
+| Verify total money in the ledger matches the expected sum, report discrepancies | Done | Behaviour 15, check 2 |
+| Transactions between different currencies using exchange rates | Done | Behaviours 7 and 8 |
+| Simultaneous transfers to the same account are safe | Done | Behaviour 10, Postgres concurrency tests |
+| Month-end reconciliation of accounts against transaction history | Done, with a limit: it reads live balances | Behaviour 15, check 1 |
+| Document the ledger's behaviour and assumptions | Done | Behaviour 1 to 15 |
 | Explain anything not implemented | Done | Known limitations, Caching |
 
 ## How it works
@@ -161,15 +154,15 @@ accounts 1 ---- * ledger_entries * ---- 1 transactions
 | Double-entry, append-only entries | Every movement balances and is auditable. Fixes are new transactions | More rows per movement |
 | Stored `balance` as a copy of the ledger | Reads are cheap | Two things to keep equal, so reconciliation checks them |
 | Unique `idempotency_key` plus an up-front check | A retry cannot move money twice, even when two copies race | The duplicate gets a 409, not the original result |
-| Row locks, always taken in the same order | No lost updates and no deadlocks | System accounts are hot rows (assumption 10) |
+| Row locks, always taken in the same order | No lost updates and no deadlocks | System accounts are hot rows (behaviour 10) |
 | EXTERNAL and FX_POSITION system accounts | Each currency nets to zero by itself, so one check covers everything | Four extra rows to lock |
 | Rate fetched at execution and stored on the transaction | History never changes when rates move | No quote step for the customer |
 | `Decimal` and `NUMERIC(18,2)` everywhere on the money path | No floating-point error | Only 2-decimal currencies |
 | Reversal is a new transaction with `reversal_of` unique | The database itself blocks a second reversal, even under a race | Refused when the recipient has already spent the money |
 
-## Assumptions
+## Behaviour
 
-Each assumption below is a rule the ledger follows. Examples use made-up numbers.
+Each item below is a rule the ledger follows. Examples use made-up numbers.
 
 **1. Money and decimal precision.**
 - Money uses exact decimal arithmetic, never binary floating-point.
@@ -203,7 +196,7 @@ Each assumption below is a rule the ledger follows. Examples use made-up numbers
 
 **5. Ledger entries are the source of truth. The stored balance is a fast copy.**
 - `accounts.balance` is updated on every posting, for customer accounts and system accounts alike, so reads are cheap.
-- Month-end reconciliation runs two checks: each account's stored balance must equal its own credits minus debits, and the balances in each currency must add up to zero (see the month-end section).
+- Month-end reconciliation runs two checks: each account's stored balance must equal its own credits minus debits, and the balances in each currency must add up to zero (see 15).
 - Entries are never edited or deleted. A mistake is fixed with a new transaction.
 
 **6. System accounts: EXTERNAL and FX_POSITION.**
@@ -279,11 +272,25 @@ Each assumption below is a rule the ledger follows. Examples use made-up numbers
 - Why: a conversion rounds the destination amount to 2 decimals, and a tiny amount can round the wrong way. Example: 0.01 SGD at 0.74 is 0.0074 USD, which rounds up to 0.01 USD, so the recipient would get more than was sent. At the same time, a small amount at a low rate could round to 0.00 and break the ledger's `amount > 0` rule. At 10 or more, the rounding difference is a fraction of a cent and the converted amount always stays positive.
 - Example: depositing 0.01 USD works. Sending 0.01 USD to a SGD account is rejected. Sending 10 USD to a SGD account works.
 
+**15. Month-end reconciliation compares every balance with the ledger.**
+- `GET /reconciliation/month-end?month=YYYY-MM` is read-only. Any discrepancy should be corrected with a new, auditable transaction. Two checks run, and both use every ledger entry.
+- **Check 1: each account against its own entries.** Ledger balance = the account's CREDIT entries minus its DEBIT entries. It must equal the stored `accounts.balance`. `difference` is stored minus ledger, so `0.00` means reconciled. System accounts are included, because their balances move with every entry.
+- Example: Alice has CREDIT 100 and DEBIT 40, so her ledger balance is 60. If her stored balance is 70, the difference is `10.00` and she is a `MISMATCH`.
+- **Check 2: each currency adds up to zero.** Every transaction's entries net to zero within each currency, so the stored balances in one currency (customers, EXTERNAL and FX_POSITION) must sum to `0.00`.
+- Example: Alice deposits 100 USD, withdraws 40, then converts 50 USD to 67.50 SGD for Bob. USD: Alice +10.00, EXTERNAL -60.00, FX_POSITION +50.00, sum 0.00. SGD: Bob +67.50, FX_POSITION -67.50, sum 0.00. Without the FX legs (behaviour 8), USD would sum to -50.00 and SGD to +67.50.
+- **The response** has one row per currency (`customers_total`, `external_total`, `fx_position_total`, `net`, `status`), one row per account (stored, ledger, difference, status, plus the month's opening, credits, debits and closing), a `summary`, `month_has_ended`, and an overall `status` of `RECONCILED` or `OUT_OF_BALANCE`. HTTP 200 either way, so read `status`. An invalid month returns 400.
+- **Consistent under live traffic.** Every balance and ledger sum is read in one SQL statement, so Postgres gives them the same snapshot. A transfer committing mid-report cannot cause a false result.
+- **Limits** (fixes are in the limitations table below):
+  - The `month` parameter labels and groups activity, but balances are live. There are no saved snapshots, so it cannot reproduce a past month after later transactions.
+  - It does not check that each transaction's own entries balance, or that the stored rate matches the amounts.
+  - It compares the ledger with itself. It cannot see money that never reached the ledger, or a difference from a real bank statement.
+  - Offsetting errors (one account 10 too high, another 10 too low) still sum to zero in check 2, but check 1 flags both accounts.
+
 ## Walkthrough: deposit, withdraw, transfer and reversal
 
-This follows one small story through the three tables. Account IDs assume a fresh database: 1 is EXTERNAL SGD, 2 is EXTERNAL USD, 3 is FX_POSITION SGD and 4 is FX_POSITION USD. Alice (5) and Bob (6) hold USD. Carol (7) holds SGD.
+This walkthrough follows one example through the three tables. Account IDs assume a fresh database: 1 is EXTERNAL SGD, 2 is EXTERNAL USD, 3 is FX_POSITION SGD and 4 is FX_POSITION USD. Alice (5) and Bob (6) hold USD. Carol (7) holds SGD.
 
-**Story**
+**Steps**
 1. Deposit 100 USD into Alice.
 2. Alice withdraws 20 USD.
 3. Alice sends 30 USD to Bob (same currency).
@@ -355,33 +362,6 @@ This follows one small story through the three tables. Account IDs assume a fres
 - **Recipient already spent the money:** the reversal is refused (400). A real system would use a dispute or compensating process, which this API does not provide.
 - **Locks:** the original transaction's row is locked, then the accounts in the usual order (customers by id, then system accounts by id), so reversals cannot deadlock with other requests.
 
-## Month-end reconciliation (implemented)
-
-Reconciliation is read-only; any discrepancy should be corrected with a new, auditable transaction.
-
-Use `GET /reconciliation/month-end?month=YYYY-MM`. Two checks run, and both use every ledger entry.
-
-**Check 1: each account against its own entries.**
-- Ledger balance = the account's CREDIT entries minus its DEBIT entries. It must equal the stored `accounts.balance`.
-- `difference` is stored minus ledger, so `0.00` means reconciled.
-- Example: Alice has CREDIT 100 and DEBIT 40, so her ledger balance is 60. If her stored balance is 70, the difference is `10.00` and she is a `MISMATCH`.
-- System accounts are included, because their balances move with every entry.
-
-**Check 2: each currency adds up to zero.**
-- Every transaction's entries net to zero within each currency, so the stored balances in one currency (customers, EXTERNAL and FX_POSITION) must sum to `0.00`.
-- Example: Alice deposits 100 USD, withdraws 40, then converts 50 USD to 67.50 SGD for Bob. USD: Alice +10.00, EXTERNAL -60.00, FX_POSITION +50.00, sum 0.00. SGD: Bob +67.50, FX_POSITION -67.50, sum 0.00.
-- This is why a conversion has four entries (assumption 8). Without the FX legs, USD would sum to -50.00 and SGD to +67.50.
-
-**The response** has one row per currency (`customers_total`, `external_total`, `fx_position_total`, `net`, `status`), one row per account (stored, ledger, difference, status, plus the month's opening, credits, debits and closing), a `summary`, `month_has_ended`, and an overall `status` of `RECONCILED` or `OUT_OF_BALANCE`. HTTP 200 either way, so read `status`. An invalid month returns 400.
-
-**Consistent under live traffic.** Every balance and ledger sum is read in one SQL statement, so Postgres gives them the same snapshot. A transfer committing mid-report cannot cause a false result.
-
-**What it cannot do** (see also the limitations table below):
-- The `month` parameter labels and groups activity, but balances are live. There are no saved snapshots, so it cannot reproduce a past month after later transactions.
-- It does not check that each transaction's own entries balance, or that the stored rate matches the amounts.
-- It compares the ledger with itself. It cannot see money that never reached the ledger, or a difference from a real bank statement.
-- Offsetting errors (one account 10 too high, another 10 too low) still sum to zero in check 2, but check 1 flags both accounts.
-
 ## Known limitations and how I would solve them
 
 These are deliberate simplifications. Each one is a gap I know about, with the fix I would make.
@@ -393,14 +373,14 @@ These are deliberate simplifications. Each one is a gap I know about, with the f
 | Reconciliation does not check each transaction | One query grouping entries by transaction and currency, flagging any group where debits differ from credits |
 | Reconciliation compares the ledger with itself | Import the real bank or custodian statement and compare its totals with EXTERNAL |
 | EXTERNAL and FX_POSITION are hot rows, so deposits, withdrawals and conversions in one currency run one after another | Split each system account into several sub-accounts and sum them |
-| Exchange rate is a daily ECB reference rate from a free service, with no quote step, spread, fallback or age check | A paid quote feed, a short-lived quote the transfer must reference, a second provider, and rejection of rates older than an agreed limit (assumption 7) |
+| Exchange rate is a daily ECB reference rate from a free service, with no quote step, spread, fallback or age check | A paid quote feed, a short-lived quote the transfer must reference, a second provider, and rejection of rates older than an agreed limit (behaviour 7) |
 | A reversal is refused when the recipient already spent the money | A dispute or compensating-transfer process |
 | No authentication or ownership checks | Authenticate callers and check that they own the source account |
 | `created_at` has no timezone and uses the database server clock | `timestamptz`, stored in UTC |
 | Customer balance cannot go below zero, and every transaction's entries balance, but only the application enforces both | A `CHECK (balance >= 0 OR is_system)` constraint, and a deferred constraint trigger that checks debits equal credits per transaction and currency |
 | Tables come from `create_all`, which never alters an existing table | Schema migrations with Alembic |
 | History uses page numbers, so a new entry arriving between page requests shifts the pages | Keyset pagination on (`created_at`, entry id) |
-| Only USD and SGD | Currency metadata (decimal places, rounding) and system accounts per new currency (assumption 2) |
+| Only USD and SGD | Currency metadata (decimal places, rounding) and system accounts per new currency (behaviour 2) |
 
 **How I would test the main fixes**
 - **Idempotent replay:** send the same request twice, expect the same body and one transaction. Send it with a different amount, expect a 422.
@@ -438,8 +418,8 @@ Balance and history reads are a good fit for caching. This is **not implemented*
 
 ## Tests and CI
 
-- `tests/test_ledger_endpoints.py` (77 tests) covers the API and business rules using a temporary SQLite database. It includes reconciliation, reversals, system accounts and a faked FX service (the network is never called in tests).
-- `tests/test_postgres_concurrency.py` (11 tests) covers locking, concurrent requests, and database rounding on PostgreSQL. SQLite cannot verify these behaviors. Examples: 20 parallel deposits into one account lose no update, 20 parallel withdrawals never overdraw, opposite-direction transfers do not deadlock, and 10 identical simultaneous requests move money once.
+- `tests/test_ledger_endpoints.py` (47 test functions) covers the API and business rules using a temporary SQLite database. It includes reconciliation, reversals, system accounts and a faked FX service (the network is never called in tests).
+- `tests/test_postgres_concurrency.py` (11 test functions) covers locking, concurrent requests, and database rounding on PostgreSQL. SQLite cannot verify these behaviors. Examples: 20 parallel deposits into one account lose no update, 20 parallel withdrawals never overdraw, opposite-direction transfers do not deadlock, and 10 identical simultaneous requests move money once.
 - Run the endpoint tests with `pytest tests/test_ledger_endpoints.py`.
 - Run the Postgres tests on their own, against an empty test database (its tables are dropped and recreated):
   `TEST_POSTGRES_URL=postgresql+psycopg://postgres:postgres@localhost:5432/ledger_test pytest tests/test_postgres_concurrency.py`
@@ -461,8 +441,15 @@ Dockerfile, docker-compose.yml, entrypoint.sh   run the API and PostgreSQL
 
 ## Local configuration
 
-Create a local `.env` file in the repository root with `POSTGRES_PASSWORD` set to a local development password. Keep this file untracked; Git ignores it. Docker Compose uses this value for the database and API connection. Run `docker compose up --build` to start the stack.
+The `.env` file is committed on purpose, so the project runs with no setup. It holds a demo credential only:
 
-When running the API outside Docker, also set `DATABASE_URL` to a PostgreSQL connection URL for your local database. Use a URL-safe password or percent-encode special characters in the URL.
+```
+DATABASE_URL=postgresql://postgres:mysecret@localhost:5432/ledger
+POSTGRES_PASSWORD=mysecret
+```
 
-These credentials are for local development only. Do not commit passwords; a real deployment should inject secrets through its platform or a secrets manager.
+- `POSTGRES_PASSWORD` is the password of the `postgres` user. Docker Compose uses it for the database and for the API's connection (inside Compose, the API connects to the `db` service, not `localhost`).
+- `DATABASE_URL` is used when running the API outside Docker. It points at a local PostgreSQL database named `ledger`.
+- Run `docker compose up --build` to start the stack.
+
+A real deployment would never commit a password. It would inject secrets through its platform or a secrets manager.

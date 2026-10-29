@@ -1,7 +1,7 @@
 """Internal ledger API (FastAPI + SQLAlchemy + Postgres).
 
-Double-entry, append-only ledger. The design and assumptions are in README.md: double-entry and
-system accounts (assumptions 4, 6, 8), locking (10), idempotency (11), reversals (walkthrough).
+Double-entry, append-only ledger. The design and behaviour are in README.md: double-entry and
+system accounts (behaviours 4, 6, 8), locking (10), idempotency (11), reversals (walkthrough).
 
 Endpoints
 ---------
@@ -44,7 +44,7 @@ from typing import Literal
 
 SUPPORTED_CURRENCIES = ["USD", "SGD"]
 
-# Minimum cross-currency transfer, in the SOURCE currency (README assumption 7).
+# Minimum cross-currency transfer, in the SOURCE currency (README behaviour 7).
 MIN_CROSS_CURRENCY_AMOUNT = Decimal("10")
 
 FRANKFURTER_URL = "https://api.frankfurter.dev/v1/latest"
@@ -66,7 +66,7 @@ def fetch_fx_rate(from_currency: str, to_currency: str):
 
     Returns (rate, rate_date): rate is a Decimal rounded to 6 places, rate_date is the day the
     rate was published ("YYYY-MM-DD", or None). Raises FxRateError on any failure and never
-    returns a guessed or cached rate (see README assumption 7).
+    returns a guessed or cached rate (see README behaviour 7).
     """
     # e.g. https://api.frankfurter.dev/v1/latest?base=USD&symbols=SGD
     query = urllib.parse.urlencode({"base": from_currency, "symbols": to_currency})
@@ -138,7 +138,7 @@ def lock_system_account(db: Session, owner_name: str, currency: str) -> models.A
     """Load one system account (EXTERNAL or FX_POSITION) with a row lock, or fail with 500.
 
     Only is_system rows count, so a customer account named "EXTERNAL" is never used. Call this
-    only AFTER the customer rows are locked (lock order, README assumption 10).
+    only AFTER the customer rows are locked (lock order, README behaviour 10).
     """
     account = (
         db.query(models.Account)
@@ -354,7 +354,7 @@ def transfer(req: TransferRequest, db: Session = Depends(get_db)):
     """Move money from one account to another in one atomic operation (POST /transactions).
 
     `amount` is in the source account's currency. Cross-currency conversion, the minimum and the
-    FX_POSITION entries are in README assumptions 7 and 8. Cheap checks run first, before the FX
+    FX_POSITION entries are in README behaviours 7 and 8. Cheap checks run first, before the FX
     call or any lock.
     """
     reject_duplicate_key(db, req.idempotency_key)
@@ -369,7 +369,7 @@ def transfer(req: TransferRequest, db: Session = Depends(get_db)):
         .filter(models.Account.id.in_([req.from_account_id, req.to_account_id]))
         .all()
     )
-    # Two rows must exist, and neither can be a system account (README assumption 6)
+    # Two rows must exist, and neither can be a system account (README behaviour 6)
     if len(rows) != 2:
         raise HTTPException(status_code=404, detail="Account not found")
     if any(row.is_system for row in rows):
@@ -384,7 +384,7 @@ def transfer(req: TransferRequest, db: Session = Depends(get_db)):
                 detail=f"Cross-currency transfers must be at least {MIN_CROSS_CURRENCY_AMOUNT} in the source currency",
             )
         try:
-            # _rate_date is not used yet, but could be returned to the client if needed (README assumption 7)
+            # _rate_date is not used yet, but could be returned to the client if needed (README behaviour 7)
             exchange_rate_used, _rate_date = fetch_fx_rate(
                 currencies[req.from_account_id], currencies[req.to_account_id]
             )
@@ -653,7 +653,7 @@ def _money(value) -> Decimal:
 
 @app.get("/reconciliation/month-end")
 def month_end_reconciliation(month: str, db: Session = Depends(get_db)):
-    """Read-only month-end reconciliation. The two checks are explained in README "Month-end reconciliation".
+    """Read-only month-end reconciliation. The two checks are explained in README behaviour 15.
 
     The month only shapes the opening / credits / debits / closing columns. Both checks always use
     every entry. `difference` is stored minus ledger (0.00 = reconciled). Returns 200 even when out

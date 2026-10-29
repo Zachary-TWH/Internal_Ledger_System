@@ -46,7 +46,7 @@ class TransactionType(str, enum.Enum):
 class Account(Base):
     """A customer or system account, in one currency.
 
-    `balance` is a stored copy of the ledger (README assumption 5). A customer balance is never
+    `balance` is a stored copy of the ledger (README behaviour 5). A customer balance is never
     allowed below zero, but main.py enforces that, not a database constraint. System balances
     may go negative. `is_system` marks EXTERNAL and FX_POSITION, which the API cannot create.
     """
@@ -65,11 +65,11 @@ class Account(Base):
 
 
 class Transaction(Base):
-    """A business event grouping related ledger entries. Append-only (README assumption 5).
+    """A business event grouping related ledger entries. Append-only (README behaviour 5).
 
     `idempotency_key` is UNIQUE. `reversal_of` is UNIQUE too, so a transaction can be reversed at
     most once, and the CHECK below ties it to `type`. `created_at` is the database server clock
-    (README assumption 12). `notes` is optional free text that no endpoint sets or returns yet.
+    (README behaviour 12). `notes` is optional free text that no endpoint sets or returns yet.
     """
 
     __tablename__ = "transactions"
