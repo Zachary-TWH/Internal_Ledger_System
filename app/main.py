@@ -220,6 +220,7 @@ class ReversalRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+# Example: POST /accounts  JSON: {"owner_name":"Alice","currency":"USD"}
 @app.post("/accounts", response_model=AccountOut)
 def create_account(account: AccountCreate, db: Session = Depends(get_db)):
     """Create a customer account with a zero balance."""
@@ -234,6 +235,7 @@ def create_account(account: AccountCreate, db: Session = Depends(get_db)):
     return new_account
 
 
+# Example: POST /deposit  JSON: {"account_id":1,"amount":"100.00","idempotency_key":"deposit-001"}
 @app.post("/deposit")
 def deposit(req: DepositRequest, db: Session = Depends(get_db)):
     """Add money to an account (DEBIT EXTERNAL, CREDIT the user)."""
@@ -277,6 +279,7 @@ def deposit(req: DepositRequest, db: Session = Depends(get_db)):
     return {"transaction_id": txn.id, "new_balance": money_str(account.balance)}
 
 
+# Example: POST /withdraw  JSON: {"account_id":1,"amount":"25.00","idempotency_key":"withdraw-001"}
 @app.post("/withdraw")
 def withdraw(req: WithdrawalRequest, db: Session = Depends(get_db)):
     """Take money out of an account (DEBIT the user, CREDIT EXTERNAL). No overdraft."""
@@ -324,6 +327,7 @@ def withdraw(req: WithdrawalRequest, db: Session = Depends(get_db)):
     return {"transaction_id": txn.id, "new_balance": money_str(account.balance)}
 
 
+# Example: POST /transactions  JSON: {"from_account_id":1,"to_account_id":2,"amount":"30.00","idempotency_key":"transfer-001"}
 @app.post("/transactions")
 def transfer(req: TransferRequest, db: Session = Depends(get_db)):
     """Move money from one account to another in one atomic operation (POST /transactions).
@@ -449,6 +453,7 @@ def transfer(req: TransferRequest, db: Session = Depends(get_db)):
     }
 
 
+# Example: POST /transactions/123/reverse  JSON: {"idempotency_key":"reverse-001"}
 @app.post("/transactions/{transaction_id}/reverse")
 def reverse_transaction(transaction_id: int, req: ReversalRequest, db: Session = Depends(get_db)):
     """Undo a transaction by posting a new REVERSAL transaction (see README "Reversal rules")."""
@@ -550,6 +555,7 @@ def reverse_transaction(transaction_id: int, req: ReversalRequest, db: Session =
     }
 
 
+# Example: GET /accounts/1
 @app.get("/accounts/{account_id}", response_model=AccountOut)
 def get_account(account_id: int, db: Session = Depends(get_db)):
     """Return one account and its current balance (also works for system accounts, for auditing)."""
@@ -559,6 +565,7 @@ def get_account(account_id: int, db: Session = Depends(get_db)):
     return account
 
 
+# Example: GET /accounts/1/transactions?page=1&page_size=20&order=desc
 @app.get("/accounts/{account_id}/transactions")
 def get_transactions(
     account_id: int,
@@ -626,6 +633,7 @@ def _money(value) -> Decimal:
     return Decimal(str(value or 0)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
 
+# Example: GET /reconciliation/month-end?month=2026-10
 @app.get("/reconciliation/month-end")
 def month_end_reconciliation(month: str, db: Session = Depends(get_db)):
     """Read-only month-end reconciliation. The two checks are explained in README behaviour 15.
