@@ -33,8 +33,8 @@ Where each item of the assignment is covered.
 
 | Requirement | Status | Where |
 |-------------|--------|-------|
-| `POST /transactions` with source, destination, amount, recorded atomically, returns transaction id | Done | API table above, behaviour 4 |
-| `GET /accounts/{id}` returns the current balance | Done | API table above |
+| `POST /transactions` with source, destination, amount, recorded atomically, returns transaction id | Done | [API at a glance](#api-at-a-glance), behaviour 4 |
+| `GET /accounts/{id}` returns the current balance | Done | [API at a glance](#api-at-a-glance) |
 | `GET /accounts/{id}/transactions` returns history ordered by timestamp | Done | Newest first by default, `order=asc` for oldest first. Ties broken by entry id so pages never overlap |
 | Transfer is one atomic operation, rejected on insufficient balance | Done | Behaviours 4 and 9 |
 | Transactions can be reversed (posted as a reversal) | Done | Walkthrough, "Reversal rules" |
@@ -478,11 +478,12 @@ Repeat the first deposit command unchanged. You get a 409 and the balance does n
 
 ### Tests and CI
 
-- `tests/test_ledger_endpoints.py` (47 test functions) covers the API and business rules using a temporary SQLite database. It includes reconciliation, reversals, system accounts and a faked FX service (the network is never called in tests).
-- `tests/test_postgres_concurrency.py` (11 test functions) covers locking, concurrent requests, and database rounding on PostgreSQL. SQLite cannot verify these behaviors. Examples: 20 parallel deposits into one account lose no update, 20 parallel withdrawals never overdraw, opposite-direction transfers do not deadlock, and 10 identical simultaneous requests move money once.
+- `tests/test_ledger_endpoints.py` (38 test functions, 45 test cases once the parametrised tests are expanded) covers the API and business rules using a temporary SQLite database. It includes reconciliation, reversals, system accounts and a faked FX service (the network is never called in tests).
+- `tests/test_postgres_concurrency.py` (11 test functions, 12 test cases) covers locking, concurrent requests, and database rounding on PostgreSQL. SQLite cannot verify these behaviors. Examples: 20 parallel deposits into one account lose no update, 20 parallel withdrawals never overdraw, opposite-direction transfers do not deadlock, and 10 identical simultaneous requests move money once.
 - Run the endpoint tests with `pytest tests/test_ledger_endpoints.py`.
-- Run the Postgres tests on their own, against an empty test database (its tables are dropped and recreated):
-  `TEST_POSTGRES_URL=postgresql+psycopg://postgres:postgres@localhost:5432/ledger_test pytest tests/test_postgres_concurrency.py`
+- Run the Postgres tests on their own, against an empty test database (its tables are dropped and recreated). With the Compose database running (`docker compose up -d db`), use the demo password from `.env`:
+  `TEST_POSTGRES_URL=postgresql+psycopg://postgres:mysecret@localhost:5432/ledger_test pytest tests/test_postgres_concurrency.py`
+- Compose creates an empty `ledger_test` database next to `ledger` the first time the database volume is created (`db/init-test-db.sql`). If your volume already existed, create it once with `docker compose exec db psql -U postgres -c "CREATE DATABASE ledger_test;"`. CI does not use this: it starts its own Postgres container with the password `postgres`.
 - Without `TEST_POSTGRES_URL`, the Postgres file is skipped.
 
 CI (`.github/workflows/ci.yml`) runs both test suites on pushes to `main`, pull requests, or manual dispatch, then builds the Docker Compose stack and performs an API smoke test. The deploy job is simulated and does not deploy anywhere.
