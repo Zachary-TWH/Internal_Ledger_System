@@ -19,7 +19,7 @@ To run it: `docker compose up --build`. Details are under [Quick start](#quick-s
 ## Contents
 
 1. [Requirements checklist](#requirements-checklist)
-2. [How it works](#how-it-works)
+2. [Data model](#data-model)
 3. [API at a glance](#api-at-a-glance)
 4. [Behaviour](#behaviour)
 5. [Walkthrough](#walkthrough-deposit-withdraw-transfer-and-reversal)
@@ -44,7 +44,7 @@ Where each item of the assignment is covered.
 | Month-end reconciliation of accounts against transaction history | Done, with a limit: it reads live balances | Behaviour 15, check 1 |
 | Explain anything not implemented | Done | Known limitations, Caching |
 
-## How it works
+## Data model
 
 ### The three tables
 
