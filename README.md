@@ -36,25 +36,26 @@ Where each item of the assignment is covered.
 | `POST /transactions` with source, destination, amount, recorded atomically, returns transaction id | Done | [API at a glance](#api-at-a-glance), behaviour 4 |
 | `GET /accounts/{id}` returns the current balance | Done | [API at a glance](#api-at-a-glance) |
 | `GET /accounts/{id}/transactions` returns history ordered by timestamp | Done | Newest first by default, `order=asc` for oldest first. Ties broken by entry id so pages never overlap |
-| Transfer is one atomic operation, rejected on insufficient balance | Done | Behaviours 4 and 9 |
+| Transfer is one atomic operation, rejected on insufficient balance | Done | Behaviours 9 and 16 |
 | Transactions can be reversed (posted as a reversal) | Done | Walkthrough, "Reversal rules" |
 | Repeated submission does not cause extra transfers | Done | Behaviour 11 |
 | Verify total money in the ledger matches the expected sum, report discrepancies | Done | Behaviour 15, check 2 |
 | Transactions between different currencies using exchange rates | Done | Behaviours 7 and 8 |
 | Simultaneous transfers to the same account are safe | Done | Behaviour 10, Postgres concurrency tests |
 | Month-end reconciliation of accounts against transaction history | Done, with a limit: it reads live balances | Behaviour 15, check 1 |
-| Document the ledger's behaviour and assumptions | Done | Behaviour 1 to 15 |
 | Explain anything not implemented | Done | Known limitations, Caching |
 
 ## How it works
 
-**Three tables**
+### The three tables
 
 ```
 accounts 1 ---- * ledger_entries * ---- 1 transactions
 ```
 
-**accounts**: one row per account. Includes 4 system accounts (EXTERNAL and FX_POSITION, one of each per currency).
+#### Table 1: `accounts`
+
+One row per account. Includes 4 system accounts (EXTERNAL and FX_POSITION, one of each per currency).
 
 | Column | Type | Null | Key / constraint | Meaning |
 |--------|------|------|------------------|---------|
@@ -64,7 +65,9 @@ accounts 1 ---- * ledger_entries * ---- 1 transactions
 | `balance` | NUMERIC(18,2) | no | | Stored copy of the ledger (default 0). A customer balance never goes below zero, enforced in the application |
 | `is_system` | Boolean | no | | True for EXTERNAL and FX_POSITION, false for customer accounts |
 
-**transactions**: one row per business event.
+#### Table 2: `transactions`
+
+One row per business event.
 
 | Column | Type | Null | Key / constraint | Meaning |
 |--------|------|------|------------------|---------|
@@ -79,7 +82,9 @@ accounts 1 ---- * ledger_entries * ---- 1 transactions
 
 Check constraint: only a REVERSAL has a `reversal_of`, and every REVERSAL has one.
 
-**ledger_entries**: one row per debit or credit posting. The source of truth.
+#### Table 3: `ledger_entries`
+
+One row per debit or credit posting. The source of truth.
 
 | Column | Type | Null | Key / constraint | Meaning |
 |--------|------|------|------------------|---------|
@@ -89,7 +94,9 @@ Check constraint: only a REVERSAL has a `reversal_of`, and every REVERSAL has on
 | `entry_type` | Enum | no | | DEBIT or CREDIT |
 | `amount` | NUMERIC(18,2) | no | check: greater than 0 | Always positive, in the currency of the account. The direction is in `entry_type` |
 
-**What one write does, with numbers.** Alice (USD, balance 100.00) transfers 30.00 to Bob (USD, balance 0.00):
+### What one write does, with numbers
+
+Alice (USD, balance 100.00) transfers 30.00 to Bob (USD, balance 0.00):
 
 1. **Idempotency check.** Has `txn-001` been used? No, so continue.
 2. **Cheap checks.** Source differs from destination, both accounts exist, neither is a system account.
@@ -100,7 +107,7 @@ Check constraint: only a REVERSAL has a `reversal_of`, and every REVERSAL has on
 7. **Update balances:** Alice 70.00, Bob 30.00.
 8. **Commit.** All of it, or none of it. A duplicate-key clash at the commit becomes a 409.
 
-**Key design decisions**
+### Key design decisions
 
 | Decision | Why | Trade-off |
 |----------|-----|-----------|
@@ -201,7 +208,7 @@ Each item below is a rule the ledger follows. Examples use made-up numbers.
 - Within each currency, a transaction's debits equal its credits. A DEBIT lowers an account's balance and a CREDIT raises it.
 - Same currency: two entries. Deposit: debit EXTERNAL, credit the user. Withdrawal: debit the user, credit EXTERNAL. Transfer: debit the source, credit the destination.
 - Cross-currency transfer: four entries, through FX_POSITION (see 8).
-- Entries and balance updates commit together, or none of them do.
+- Entries and balance updates commit together, or none of them do (see 16).
 
 **5. Ledger entries are the source of truth. The stored balance is a fast copy.**
 - `accounts.balance` is updated on every posting, for customer accounts and system accounts alike, so reads are cheap.
@@ -293,6 +300,12 @@ Each item below is a rule the ledger follows. Examples use made-up numbers.
   - It does not check that each transaction's own entries balance, or that the stored rate matches the amounts.
   - It compares the ledger with itself. It cannot see money that never reached the ledger, or a difference from a real bank statement.
   - Offsetting errors (one account 10 too high, another 10 too low) still sum to zero in check 2, but check 1 flags both accounts.
+
+**16. A transfer is atomic: all of it happens, or none of it.**
+- A transfer writes its transaction row, its ledger entries and the balance updates inside one database transaction, with a single `commit()` at the very end. Nothing is saved before that, and other requests see none of it until then.
+- If anything fails before the commit (insufficient funds, a duplicate key, a crash), the uncommitted work is rolled back, so a partial transfer is never saved.
+- The funds check runs after the accounts are locked and before anything is written (see 9 and 10), so a rejected transfer writes nothing.
+- Example: Alice sends 30.00 to Bob. If posting Bob's credit fails, Alice is not debited and no entry exists.
 
 ## Walkthrough: deposit, withdraw, transfer and reversal
 
