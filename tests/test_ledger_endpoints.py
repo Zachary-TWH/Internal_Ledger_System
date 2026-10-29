@@ -760,6 +760,21 @@ def test_reverse_cross_currency_transfer_uses_original_amounts_not_todays_rate()
     assert sorted(a for _, _, a in entries_of(reversal)) == [Decimal("40.00"), Decimal("40.00"), Decimal("54.00"), Decimal("54.00")]
 
 
+def test_repeated_idempotency_key_returns_original_transaction_and_moves_nothing():
+    alice, bob = new_account("alice"), new_account("bob")
+    deposit(alice, 100, "d1")
+    first = post_transfer(alice, bob, 30, "t1")
+    rows_before = (count_rows(models.Transaction), count_rows(models.LedgerEntry))
+
+    retry = post_transfer(alice, bob, 30, "t1")
+
+    assert retry.status_code == 200
+    assert retry.json() == {"transaction_id": first.json()["transaction_id"], "status": "already_processed"}
+    assert balance_of(alice) == 70 and balance_of(bob) == 30
+    assert (count_rows(models.Transaction), count_rows(models.LedgerEntry)) == rows_before
+
+
+
 # A transaction can be reversed only once (409). This is enforced in code and, as a
 #   backstop, by the UNIQUE constraint on reversal_of.
 def test_reverse_same_transaction_twice_is_rejected_and_moves_nothing():

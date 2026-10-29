@@ -105,7 +105,7 @@ Alice (USD, balance 100.00) transfers 30.00 to Bob (USD, balance 0.00):
 5. **Check funds.** 100.00 is at least 30.00, so continue.
 6. **Insert** the transaction row and its entries: DEBIT Alice 30.00, CREDIT Bob 30.00.
 7. **Update balances:** Alice 70.00, Bob 30.00.
-8. **Commit.** All of it, or none of it. A duplicate-key clash at the commit becomes a 409.
+8. **Commit.** All of it, or none of it. A duplicate-key clash at the commit becomes a 409 (two identical requests racing).
 
 ### Key design decisions
 
@@ -113,7 +113,7 @@ Alice (USD, balance 100.00) transfers 30.00 to Bob (USD, balance 0.00):
 |----------|-----|-----------|
 | Double-entry, append-only entries | Every movement balances and is auditable. Fixes are new transactions | More rows per movement |
 | Stored `balance` as a copy of the ledger | Reads are cheap | Two things to keep equal, so reconciliation checks them |
-| Unique `idempotency_key` plus an up-front check | A retry cannot move money twice, even when two copies race | The duplicate gets a 409, not the original result |
+| Unique `idempotency_key` plus an up-front check | A retry cannot move money twice, even when two copies race | A retry returns the original transaction id, not the full original response |
 | Row locks, always taken in the same order | No lost updates and no deadlocks | System accounts are hot rows (behaviour 10) |
 | EXTERNAL and FX_POSITION system accounts | Each currency nets to zero by itself, so one check covers everything | Four extra rows to lock |
 | Rate fetched at execution and stored on the transaction | History never changes when rates move | No quote step for the customer |
@@ -130,7 +130,7 @@ Each item is a problem that money systems hit, what a simple approach would do, 
 
 **2. A client retries after a timeout.** Transfer `txn-001` succeeded, but the response was lost.
 - **Simple approach:** the retry moves the money a second time.
-- **This ledger:** the unique `idempotency_key` rejects the retry with a 409 and the balance does not change. Two identical requests arriving together are stopped by the same constraint, so the loser gets a 409, not a 500 (behaviour 11).
+- **This ledger:** a retry with the same `idempotency_key` returns the original `transaction_id` with 200 and the balance does not change. Two identical requests arriving together are stopped by the unique constraint, so the loser gets a 409, not a 500 (behaviour 11).
 
 **3. Rounding.** `0.1 + 0.2`.
 - **Simple approach:** floats give `0.30000000000000004`, and errors build up over many transactions.
@@ -172,7 +172,7 @@ Every write takes a unique `idempotency_key`. Amounts are sent as strings such a
 | 200 | Done |
 | 400 | A business rule refused it: insufficient funds, system account used, same source and destination, below the cross-currency minimum, reversal not allowed |
 | 404 | Account or transaction not found |
-| 409 | Duplicate `idempotency_key`, or transaction already reversed |
+| 409 | Two identical requests raced and this one lost, or transaction already reversed |
 | 422 | Invalid body: amount not above zero, more than 2 decimals, missing field, unsupported currency |
 | 503 | Cross-currency transfer and the exchange rate is unavailable. Nothing is recorded |
 | 500 | A system account is missing (setup problem) |
@@ -267,10 +267,10 @@ Each item below is a rule the ledger follows. Examples use made-up numbers.
 - `POST /transactions` is the transfer: source, destination, and amount. `POST /deposit` and `POST /withdraw` fund and drain accounts through the EXTERNAL account.
 - Deposit, withdrawal, reversal and transfer all take an `idempotency_key`.
 - The key is saved on the transaction. The database column has a unique constraint, a rule that no two rows can hold the same key.
-- A reused key returns 409 and moves no money.
-- Example: a client retries `transfer-001` after a timeout. The second call is rejected, so the money moves once.
-- Two identical requests arriving at the same moment can both pass the up-front check. The unique constraint then rejects the loser, and the API turns that into the same clean 409 (never a 500).
-- Limit: the 409 does not return the original result, and it does not check whether the retry had the same details.
+- A reused key returns 200 with `{"transaction_id": <original id>, "status": "already_processed"}` and moves no money.
+- Example: a client retries `transfer-001` after a timeout. It gets the id of the first attempt back, so it knows the transfer worked and the money moved once.
+- Two identical requests arriving at the same moment can both pass the up-front check. The unique constraint then rejects the loser, and the API turns that into a clean 409 (never a 500). The client's next retry gets the 200 above.
+- Limit: only the transaction id is returned, not the full original response, and nothing checks whether the retry had the same details.
 
 **12. Timestamps use the database server clock.**
 - `created_at` is stored without a timezone.
@@ -391,7 +391,7 @@ This walkthrough follows one example through the three tables. Account IDs assum
 | Reverse transaction 5 | 400 | its type is REVERSAL |
 | Reverse transaction 1 (the 100 USD deposit) | 400 | Alice only has 50.00, so undoing it would take her below zero |
 | Reverse transaction 99 | 404 | no such transaction |
-| Reuse an idempotency key | 409 | the key was already used |
+| Reuse an idempotency key | 200 | the key was already used, so the original `transaction_id` comes back with `status: already_processed` and nothing is posted |
 
 - **Why `type` and `reversal_of`:** code checks the `type` column, not the free-text description. `reversal_of` is unique, so the database itself blocks a second reversal even if two requests race. A check constraint ties the two together: only a REVERSAL has a `reversal_of`, and every REVERSAL has one.
 - **Recipient already spent the money:** the reversal is refused (400). A real system would use a dispute or compensating process, which this API does not provide.
@@ -405,7 +405,7 @@ These are deliberate simplifications. Each one is a gap I know about, with the f
 
 | Limitation | Fix I would make |
 |------------|------------------|
-| A duplicate request gets a 409, not the original result, and a retry with different details is not detected | Store the response and a hash of the request body with the key. Return the stored response when the hash matches, and a 422 when it does not |
+| A duplicate request returns only the original transaction id, not the full response, and a retry with different details is not detected | Store the response and a hash of the request body with the key. Return the stored response when the hash matches, and a 422 when it does not |
 | Month-end reads live balances, so a past month cannot be reproduced. It also sums the whole ledger on every call, so it gets slower as history grows | I would add a monthly snapshot. A write-once `account_snapshots` table (`account_id`, `month`, `closing_balance`, `last_entry_id`), written by a scheduled job right after the check reports `RECONCILED`. Summing one month's snapshots per currency must give 0.00. The report would then start from the last snapshot (its `closing_balance` is the opening balance) and sum only the entries after its `last_entry_id`, so the cost depends on one month of activity and not on the whole history |
 | Reconciliation does not check each transaction | One query grouping entries by transaction and currency, flagging any group where debits differ from credits |
 | Reconciliation compares the ledger with itself | Import the real bank or custodian statement and compare its totals with EXTERNAL |
@@ -477,7 +477,7 @@ curl -s localhost:8000/accounts/5/transactions
 curl -s "localhost:8000/reconciliation/month-end?month=2026-10"
 ```
 
-Repeat the first deposit command unchanged. You get a 409 and the balance does not change: that is the idempotency key doing its job.
+Repeat the first deposit command unchanged. You get a 200 with the first deposit's `transaction_id` and `status: already_processed`, and the balance does not change: that is the idempotency key doing its job.
 
 **Reset to an empty database:** `docker compose down -v`.
 
