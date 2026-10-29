@@ -20,12 +20,11 @@ To run it: `docker compose up --build`. Details are under [Quick start](#quick-s
 
 1. [Requirements checklist](#requirements-checklist)
 2. [How it works](#how-it-works)
-3. [Problems this design solves](#problems-this-design-solves)
-4. [API at a glance](#api-at-a-glance)
-5. [Behaviour](#behaviour)
-6. [Walkthrough](#walkthrough-deposit-withdraw-transfer-and-reversal)
-7. [Known limitations and how I would solve them](#known-limitations-and-how-i-would-solve-them)
-8. [Running and testing it](#running-and-testing-it): [Quick start](#quick-start), [Tests and CI](#tests-and-ci), [Project layout](#project-layout), [Local configuration](#local-configuration)
+3. [API at a glance](#api-at-a-glance)
+4. [Behaviour](#behaviour)
+5. [Walkthrough](#walkthrough-deposit-withdraw-transfer-and-reversal)
+6. [Known limitations and how I would solve them](#known-limitations-and-how-i-would-solve-them)
+7. [Running and testing it](#running-and-testing-it): [Quick start](#quick-start), [Tests and CI](#tests-and-ci), [Project layout](#project-layout), [Local configuration](#local-configuration)
 
 ## Requirements checklist
 
@@ -119,34 +118,6 @@ Alice (USD, balance 100.00) transfers 30.00 to Bob (USD, balance 0.00):
 | Rate fetched at execution and stored on the transaction | History never changes when rates move | No quote step for the customer |
 | `Decimal` and `NUMERIC(18,2)` everywhere on the money path | No floating-point error | Only 2-decimal currencies |
 | Reversal is a new transaction with `reversal_of` unique | The database itself blocks a second reversal, even under a race | Refused when the recipient has already spent the money |
-
-## Problems this design solves
-
-Each item is a problem that money systems hit, what a simple approach would do, and what this ledger does instead.
-
-**1. Two withdrawals at the same moment.** Account balance 100.00, two withdrawals of 80.00.
-- **Simple approach:** both read 100.00, both pass the check, and the balance ends at -60.00.
-- **This ledger:** the account row is locked (`SELECT ... FOR UPDATE`). The second request waits, reads 20.00 and is rejected with "Insufficient funds" (behaviours 9 and 10).
-
-**2. A client retries after a timeout.** Transfer `txn-001` succeeded, but the response was lost.
-- **Simple approach:** the retry moves the money a second time.
-- **This ledger:** a retry with the same `idempotency_key` returns the original `transaction_id` with 200 and the balance does not change. Two identical requests arriving together are stopped by the unique constraint, so the loser gets a 409, not a 500 (behaviour 11).
-
-**3. Rounding.** `0.1 + 0.2`.
-- **Simple approach:** floats give `0.30000000000000004`, and errors build up over many transactions.
-- **This ledger:** `Decimal` in Python and `NUMERIC(18,2)` in Postgres give exactly `0.30`. An amount like `10.005` is rejected, not silently rounded (behaviour 1).
-
-**4. A conversion that does not balance.** Alice sends 50 USD and Bob receives 67.50 SGD.
-- **Simple approach:** two entries, -50 USD on Alice and +67.50 SGD on Bob. USD now sums to -50 and SGD to +67.50, so no currency adds up to zero and the totals cannot be checked.
-- **This ledger:** four entries through FX_POSITION, so USD nets to 0 and SGD nets to 0 on their own (behaviour 8).
-
-**5. Fixing a mistake.** A transfer was wrong.
-- **Simple approach:** edit or delete the row. The history is lost and stored balances may stop matching the entries.
-- **This ledger:** post a new REVERSAL transaction with the entries swapped. The original stays untouched, and the unique `reversal_of` stops a second reversal even under a race (walkthrough, "Reversal rules").
-
-**6. Deadlock.** Transfers A to B and B to A at the same time.
-- **Simple approach:** each locks its own source account first. A holds 5 and waits for 6, B holds 6 and waits for 5, and both hang.
-- **This ledger:** every request locks accounts in ascending id order, so both lock 5 first and one waits (behaviour 10).
 
 ## API at a glance
 
