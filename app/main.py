@@ -1,29 +1,4 @@
-"""Internal ledger API (FastAPI + SQLAlchemy + Postgres).
-
-Double-entry, append-only ledger. The design and behaviour are in README.md: double-entry and
-system accounts (behaviours 4, 6, 8), locking (10), idempotency (11), reversals (walkthrough).
-
-Endpoints
----------
-POST /accounts                    create a customer account (USD or SGD, starts at 0.00)
-POST /deposit                     money in from EXTERNAL
-POST /withdraw                    money out to EXTERNAL (no overdraft)
-POST /transactions                transfer between two customer accounts (converted if the currencies differ)
-POST /transactions/{id}/reverse   undo a transaction by posting a new REVERSAL transaction
-GET  /accounts/{id}               one account and its current balance
-GET  /accounts/{id}/transactions  the account's ledger entries, paginated
-GET  /reconciliation/month-end    read-only two-part reconciliation report
-
-Conventions
------------
-- Money in a response is a 2-decimal string such as "60.00" (never a float), and
-  `exchange_rate_used` is a 6-decimal string such as "1.350000".
-- Status codes: 400 a business rule refused the request (insufficient funds, system account, ...),
-  404 unknown id, 409 duplicate idempotency_key or transaction already reversed, 422 the request
-  body or query failed validation, 503 the live FX rate was unavailable, 500 a system account is
-  missing (setup problem, see create_table.py).
-- No authentication (a deliberate simplification, see the README).
-"""
+"""FastAPI application for the internal ledger."""
 
 import json
 import urllib.error
