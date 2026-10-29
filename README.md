@@ -397,8 +397,6 @@ This walkthrough follows one example through the three tables. Account IDs assum
 
 ## Known limitations and how I would solve them
 
-**Out of scope on purpose.** This is an assignment, not a production system, so these are left out deliberately: authentication and ownership checks, schema migrations, caching, currencies beyond USD and SGD, a paid or redundant FX feed, and scheduled jobs. The table below says how I would handle each gap that matters.
-
 These are deliberate simplifications. Each one is a gap I know about, with the fix I would make.
 
 | Limitation | Fix I would make |
@@ -414,7 +412,6 @@ These are deliberate simplifications. Each one is a gap I know about, with the f
 | `created_at` has no timezone and uses the database server clock | `timestamptz`, stored in UTC |
 | Customer balance cannot go below zero, and every transaction's entries balance, but only the application enforces both | A `CHECK (balance >= 0 OR is_system)` constraint, and a deferred constraint trigger that checks debits equal credits per transaction and currency |
 | Tables come from `create_all`, which never alters an existing table | Schema migrations with Alembic |
-| Only USD and SGD | Currency metadata (decimal places, rounding) and system accounts per new currency (behaviour 2) |
 | Caching is not implemented; repeated reads of popular balances and transaction histories can significantly increase database load | Cache these reads in Redis with a short expiry and invalidate affected entries after successful writes. Treat cached balances as display-only; money-moving requests must always check PostgreSQL under a row lock |
 
 **How I would test the main fixes**
