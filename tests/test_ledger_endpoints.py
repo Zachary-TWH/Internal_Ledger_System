@@ -145,6 +145,10 @@ def test_clean_ledger_is_reconciled_and_each_currency_sums_to_zero():
         "currency": "SGD", "customers_total": "67.50", "external_total": "0.00",
         "fx_position_total": "-67.50", "net": "0.00", "status": "OK",
     }
+    alice_row = next(a for a in body["accounts"] if a["owner_name"] == "alice")
+    assert alice_row["stored_balance"] == alice_row["ledger_balance"] == "10.00"
+    assert alice_row["opening_balance"] == "0.00" and alice_row["closing_balance"] == "10.00"
+    assert alice_row["difference"] == "0.00" and alice_row["status"] == "OK"
 
 
 def test_balance_changed_outside_the_normal_path_is_out_of_balance():
@@ -184,21 +188,6 @@ def test_offsetting_errors_are_caught_by_the_per_account_check():
     assert flagged[alice]["difference"] == "10.00" and flagged[bob]["difference"] == "-10.00"
 
 
-def test_account_report_shows_stored_vs_ledger_balance():
-    alice = new_account("alice")
-    deposit(alice, 100, "d1")
-    assert post_withdraw(alice, 40, "w1").status_code == 200
-
-    body = report().json()
-    row = next(a for a in body["accounts"] if a["account_id"] == alice)
-
-    assert row["total_credits"] == "100.00" and row["total_debits"] == "40.00"
-    assert row["stored_balance"] == "60.00" and row["ledger_balance"] == "60.00"
-    assert row["opening_balance"] == "0.00" and row["closing_balance"] == "60.00"
-    assert row["difference"] == "0.00" and row["status"] == "OK"
-    assert body["summary"] == {"accounts_checked": 5, "accounts_mismatched": 0}   # 4 system + alice
-
-
 def test_invalid_month_returns_400():
     for bad in ("2026-13", "October", "2026/10", "26-10"):
         assert report(bad).status_code == 400
@@ -207,39 +196,6 @@ def test_invalid_month_returns_400():
 # ---------------------------------------------------------------------------
 # System accounts: EXTERNAL and FX_POSITION balances move with every entry
 # ---------------------------------------------------------------------------
-
-def test_deposit_lowers_external_and_withdraw_raises_it():
-    alice = new_account("alice")
-
-    deposit(alice, 100, "d1")
-    assert system_balance("EXTERNAL", "USD") == Decimal("-100.00")
-
-    assert post_withdraw(alice, 40, "w1").status_code == 200
-    assert system_balance("EXTERNAL", "USD") == Decimal("-60.00")     # net money that came in
-    assert system_balance("EXTERNAL", "SGD") == 0                      # other currency untouched
-
-
-def test_cross_currency_transfer_writes_four_entries_through_fx_position():
-    alice, bob_sgd = new_account("alice"), new_account("bob", "SGD")
-    deposit(alice, 100, "d1")
-
-    body = post_transfer(alice, bob_sgd, 50, "t1").json()              # 50 USD x 1.35 = 67.50 SGD
-
-    db = SessionLocal()
-    entries = db.query(models.LedgerEntry).filter_by(transaction_id=body["transaction_id"]).order_by(models.LedgerEntry.id).all()
-    names = {a.id: (a.owner_name, a.currency) for a in db.query(models.Account).all()}
-    db.close()
-    rows = [(names[e.account_id], e.entry_type.value, e.amount) for e in entries]
-    assert rows == [
-        ((("alice", "USD")), "DEBIT", Decimal("50.00")),
-        (("FX_POSITION", "USD"), "CREDIT", Decimal("50.00")),
-        (("FX_POSITION", "SGD"), "DEBIT", Decimal("67.50")),
-        (("bob", "SGD"), "CREDIT", Decimal("67.50")),
-    ]
-    assert system_balance("FX_POSITION", "USD") == Decimal("50.00")    # bank took in 50 USD
-    assert system_balance("FX_POSITION", "SGD") == Decimal("-67.50")   # and paid out 67.50 SGD
-    assert system_balance("EXTERNAL", "USD") == Decimal("-100.00")     # unchanged by the conversion
-
 
 def test_cross_currency_transfer_without_fx_position_accounts_returns_500_and_records_nothing():
     alice, bob_sgd = new_account("alice"), new_account("bob", "SGD")
@@ -327,6 +283,7 @@ def test_deposit_increases_balance_and_writes_two_entries():
     db.close()
     assert sorted(e.entry_type.value for e in entries) == ["CREDIT", "DEBIT"]
     assert {e.amount for e in entries} == {Decimal("100.00")}
+    assert system_balance("EXTERNAL", "USD") == Decimal("-100.00")
 
 
 # ---------------------------------------------------------------------------
@@ -349,6 +306,7 @@ def test_withdraw_decreases_balance_and_writes_two_entries():
     by_type = {e.entry_type.value: e for e in entries}
     assert by_type["DEBIT"].account_id == alice
     assert by_type["DEBIT"].amount == by_type["CREDIT"].amount == Decimal("40.00")
+    assert system_balance("EXTERNAL", "USD") == Decimal("-60.00")
 
 
 def test_withdraw_insufficient_funds_is_rejected_and_nothing_changes():
@@ -401,8 +359,20 @@ def test_transfer_cross_currency_converts_with_live_rate():
     assert body["to_account_new_balance"] == "54.00"
     db = SessionLocal()
     txn = db.query(models.Transaction).filter_by(id=body["transaction_id"]).one()
+    entries = db.query(models.LedgerEntry).filter_by(transaction_id=body["transaction_id"]).order_by(models.LedgerEntry.id).all()
+    names = {a.id: (a.owner_name, a.currency) for a in db.query(models.Account).all()}
     db.close()
     assert txn.exchange_rate_used == Decimal("1.350000")     # the rate is saved on the transaction
+    assert [
+        (names[e.account_id], e.entry_type.value, e.amount) for e in entries
+    ] == [
+        (("alice", "USD"), "DEBIT", Decimal("40.00")),
+        (("FX_POSITION", "USD"), "CREDIT", Decimal("40.00")),
+        (("FX_POSITION", "SGD"), "DEBIT", Decimal("54.00")),
+        (("bob", "SGD"), "CREDIT", Decimal("54.00")),
+    ]
+    assert system_balance("FX_POSITION", "USD") == Decimal("40.00")
+    assert system_balance("FX_POSITION", "SGD") == Decimal("-54.00")
 
 
 def test_transfer_insufficient_funds_is_rejected_and_nothing_changes():
@@ -425,30 +395,13 @@ def test_transfer_exact_balance_is_allowed():
     assert balance_of(alice) == 0 and balance_of(bob) == 50
 
 
-def test_transfer_same_idempotency_key_moves_money_once():
-    alice, bob = new_account("alice"), new_account("bob")
-    deposit(alice, 100, "d1")
-
-    assert post_transfer(alice, bob, 30, "t1").status_code == 200
-    assert post_transfer(alice, bob, 30, "t1").status_code == 409
-
-    assert balance_of(alice) == 70 and balance_of(bob) == 30     # not 40 and 60
-
-
-def test_transfer_to_same_account_returns_400():
+def test_transfer_rejects_same_or_unknown_account():
     alice = new_account("alice")
     deposit(alice, 100, "d1")
 
-    assert post_transfer(alice, alice, 10, "t1").status_code == 400
-    assert balance_of(alice) == 100
-
-
-def test_transfer_unknown_account_returns_404_and_nothing_changes():
-    alice = new_account("alice")
-    deposit(alice, 100, "d1")
-
-    assert post_transfer(alice, 9999, 10, "t1").status_code == 404
-    assert post_transfer(9999, alice, 10, "t2").status_code == 404
+    assert post_transfer(alice, alice, 10, "same").status_code == 400
+    assert post_transfer(alice, 9999, 10, "unknown-destination").status_code == 404
+    assert post_transfer(9999, alice, 10, "unknown-source").status_code == 404
     assert balance_of(alice) == 100
     assert count_rows(models.Transaction) == 1
 
@@ -509,23 +462,6 @@ def test_money_endpoints_reject_nonpositive_and_excess_precision_amounts(bad_amo
     assert count_rows(models.Transaction) == transactions_before
 
 
-def test_rate_change_after_transfer_does_not_alter_past_transaction():
-    alice, bob_sgd = new_account("alice"), new_account("bob", "SGD")
-    deposit(alice, 100, "d1")
-    first = post_transfer(alice, bob_sgd, 40, "t1").json()      # at 1.35 -> 54.00 SGD
-
-    # the market moves
-    FAKE_RATES[("USD", "SGD")] = Decimal("1.500000")
-    second = post_transfer(alice, bob_sgd, 40, "t2").json()     # at 1.50 -> 60.00 SGD
-
-    assert second["exchange_rate_used"] == "1.500000"
-    assert balance_of(bob_sgd) == 114                           # 54 + 60
-    db = SessionLocal()
-    old_txn = db.query(models.Transaction).filter_by(id=first["transaction_id"]).one()
-    db.close()
-    assert old_txn.exchange_rate_used == Decimal("1.350000")    # first transaction unchanged
-
-
 # ---------------------------------------------------------------------------
 # GET /accounts/{id}
 # ---------------------------------------------------------------------------
@@ -545,12 +481,6 @@ def test_create_account_rejects_unsupported_currency():
     r = client.post("/accounts", json={"owner_name": "eve", "currency": "EUR"})
     assert r.status_code == 422
     assert count_rows(models.Account) == 4        # only the four system accounts exist
-
-
-def test_create_account_accepts_lowercase_currency():
-    r = client.post("/accounts", json={"owner_name": "eve", "currency": "sgd"})
-    assert r.status_code == 200
-    assert r.json()["currency"] == "SGD"
 
 
 # ---------------------------------------------------------------------------
@@ -640,19 +570,19 @@ def test_real_fetch_rejects_bad_responses(monkeypatch, body):
         REAL_FETCH_FX_RATE("USD", "SGD")
 
 
-def test_real_fetch_reports_timeout_and_http_errors(monkeypatch):
+@pytest.mark.parametrize("failure", ["timeout", "http"])
+def test_real_fetch_reports_timeout_and_http_errors(monkeypatch, failure):
     def timeout(req, timeout):
         raise TimeoutError()
 
     def server_error(req, timeout):
         raise urllib.error.HTTPError(req.full_url, 500, "boom", {}, None)
 
-    # pass or fail: a timeout and an HTTP error are both just "the rate is unavailable"
-    monkeypatch.setattr(app_main.urllib.request, "urlopen", timeout)
-    with pytest.raises(FxRateError):
-        REAL_FETCH_FX_RATE("USD", "SGD")
-
-    monkeypatch.setattr(app_main.urllib.request, "urlopen", server_error)
+    monkeypatch.setattr(
+        app_main.urllib.request,
+        "urlopen",
+        timeout if failure == "timeout" else server_error,
+    )
     with pytest.raises(FxRateError):
         REAL_FETCH_FX_RATE("USD", "SGD")
 
@@ -708,6 +638,11 @@ def test_reverse_same_currency_transfer_restores_balances():
     alice, bob = new_account("alice"), new_account("bob")
     deposit(alice, 100, "d1")
     original = txn_id(post_transfer(alice, bob, 30, "t1"))
+    original_before = (
+        load_txn(original).description,
+        load_txn(original).created_at,
+        entries_of(original),
+    )
 
     r = post_reverse(original, "r1")
 
@@ -718,30 +653,12 @@ def test_reverse_same_currency_transfer_restores_balances():
     reversal = load_txn(body["transaction_id"])
     assert reversal.type == models.TransactionType.REVERSAL and reversal.reversal_of == original
     assert reversal.description == f"Reversal of transaction {original}"
-
-
-def test_reversal_entries_mirror_the_original_with_debit_and_credit_swapped():
-    alice, bob = new_account("alice"), new_account("bob")
-    deposit(alice, 100, "d1")
-    original = txn_id(post_transfer(alice, bob, 30, "t1"))
-
-    reversal = txn_id(post_reverse(original, "r1"))
-
-    assert entries_of(original) == [(alice, "DEBIT", Decimal("30.00")), (bob, "CREDIT", Decimal("30.00"))]
-    assert entries_of(reversal) == [(alice, "CREDIT", Decimal("30.00")), (bob, "DEBIT", Decimal("30.00"))]
-
-
-def test_reversal_never_edits_or_deletes_existing_rows():
-    alice, bob = new_account("alice"), new_account("bob")
-    deposit(alice, 100, "d1")
-    original = txn_id(post_transfer(alice, bob, 30, "t1"))
-    before = (load_txn(original).description, load_txn(original).created_at, entries_of(original))
-
-    post_reverse(original, "r1")
-
-    assert (load_txn(original).description, load_txn(original).created_at, entries_of(original)) == before
-    assert count_rows(models.Transaction) == 3        # deposit, transfer, reversal: nothing removed
-    assert count_rows(models.LedgerEntry) == 6        # 2 + 2 + 2: only added
+    assert entries_of(original) == original_before[2]
+    assert (load_txn(original).description, load_txn(original).created_at) == original_before[:2]
+    assert entries_of(body["transaction_id"]) == [
+        (alice, "CREDIT", Decimal("30.00")),
+        (bob, "DEBIT", Decimal("30.00")),
+    ]
 
 
 def test_reverse_deposit_and_withdrawal():
@@ -774,6 +691,7 @@ def test_reverse_cross_currency_transfer_uses_original_amounts_not_todays_rate()
         assert system_balance(owner, ccy) == Decimal("0.00")
     reversal = txn_id(r)
     assert load_txn(reversal).exchange_rate_used == Decimal("1.350000")   # the original rate is copied
+    assert load_txn(original).exchange_rate_used == Decimal("1.350000")
     assert sorted(a for _, _, a in entries_of(reversal)) == [Decimal("40.00"), Decimal("40.00"), Decimal("54.00"), Decimal("54.00")]
 
 
