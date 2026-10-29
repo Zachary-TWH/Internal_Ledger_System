@@ -3,6 +3,5 @@ venv/
 __pycache__/
 *.pyc
 .pytest_cache/
-.env
 linux.txt
 .vscode/
