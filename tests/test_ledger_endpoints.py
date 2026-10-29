@@ -128,7 +128,7 @@ def count_rows(model):
 # GET /reconciliation/month-end
 # ---------------------------------------------------------------------------
 
-# Interview: The core double-entry invariant: in every currency, customers + EXTERNAL + FX_POSITION
+# The core double-entry invariant: in every currency, customers + EXTERNAL + FX_POSITION
 #   nets to 0, and each account's stored balance equals the sum of its own ledger entries.
 def test_clean_ledger_is_reconciled_and_each_currency_sums_to_zero():
     alice, bob_sgd = new_account("alice"), new_account("bob", "SGD")
@@ -153,7 +153,7 @@ def test_clean_ledger_is_reconciled_and_each_currency_sums_to_zero():
     assert alice_row["difference"] == "0.00" and alice_row["status"] == "OK"
 
 
-# Interview: Proves reconciliation really detects tampering: we edit a balance directly in the DB
+# Proves reconciliation really detects tampering: we edit a balance directly in the DB
 #   (bypassing the API) and only the affected currency flips to OUT_OF_BALANCE.
 def test_balance_changed_outside_the_normal_path_is_out_of_balance():
     alice, bob_sgd = new_account("alice"), new_account("bob", "SGD")
@@ -171,7 +171,7 @@ def test_balance_changed_outside_the_normal_path_is_out_of_balance():
     assert currency_row(body, "SGD")["status"] == "OK"        # the other currency is unaffected
 
 
-# Interview: Why there are TWO checks: +10 on one account and -10 on another cancel out in the
+# Why there are TWO checks: +10 on one account and -10 on another cancel out in the
 #   currency total, so only the per-account stored-vs-ledger comparison catches them.
 def test_offsetting_errors_are_caught_by_the_per_account_check():
     """+10 on one account and -10 on another cancel out in the per-currency sum, but each
@@ -194,7 +194,7 @@ def test_offsetting_errors_are_caught_by_the_per_account_check():
     assert flagged[alice]["difference"] == "10.00" and flagged[bob]["difference"] == "-10.00"
 
 
-# Interview: Input validation on the month parameter (YYYY-MM): bad input should give a clean 400,
+# Input validation on the month parameter (YYYY-MM): bad input should give a clean 400,
 #   not a 500.
 def test_invalid_month_returns_400():
     for bad in ("2026-13", "October", "2026/10", "26-10"):
@@ -205,7 +205,7 @@ def test_invalid_month_returns_400():
 # System accounts: EXTERNAL and FX_POSITION balances move with every entry
 # ---------------------------------------------------------------------------
 
-# Interview: Atomicity on failure: if the system is misconfigured the request fails with 500 and
+# Atomicity on failure: if the system is misconfigured the request fails with 500 and
 #   nothing is half-written (no transaction row, no entries, balances unchanged).
 def test_cross_currency_transfer_without_fx_position_accounts_returns_500_and_records_nothing():
     alice, bob_sgd = new_account("alice"), new_account("bob", "SGD")
@@ -222,7 +222,7 @@ def test_cross_currency_transfer_without_fx_position_accounts_returns_500_and_re
     assert count_rows(models.Transaction) == 1                         # only the deposit
 
 
-# Interview: Security of the lookup: EXTERNAL is found by is_system=True, so a customer who
+# Security of the lookup: EXTERNAL is found by is_system=True, so a customer who
 #   registers an account named 'EXTERNAL' cannot hijack the funding account.
 def test_deposit_needs_a_real_system_account_not_a_customer_called_external():
     db = SessionLocal()
@@ -248,7 +248,7 @@ def system_account_id(owner_name, currency):
         db.close()
 
 
-# Interview: EXTERNAL and FX_POSITION are internal plumbing; letting customers deposit to or
+# EXTERNAL and FX_POSITION are internal plumbing; letting customers deposit to or
 #   withdraw from them would let them manipulate the ledger's own counterparties.
 @pytest.mark.parametrize(
     ("owner_name", "endpoint"),
@@ -267,7 +267,7 @@ def test_system_accounts_cannot_be_used_by_deposit_or_withdrawal(owner_name, end
     assert count_rows(models.Transaction) == 0 and count_rows(models.LedgerEntry) == 0
 
 
-# Interview: Closes the same loophole on the public transfer endpoint: nobody can move money into or
+# Closes the same loophole on the public transfer endpoint: nobody can move money into or
 #   out of a system account directly.
 def test_transfer_from_or_to_a_system_account_is_rejected():
     alice = new_account("alice")
@@ -285,7 +285,7 @@ def test_transfer_from_or_to_a_system_account_is_rejected():
 # POST /deposit
 # ---------------------------------------------------------------------------
 
-# Interview: Double-entry in action: one deposit is one transaction with a DEBIT on EXTERNAL and a
+# Double-entry in action: one deposit is one transaction with a DEBIT on EXTERNAL and a
 #   CREDIT on the customer, so money is never created from nothing.
 def test_deposit_increases_balance_and_writes_two_entries():
     alice = new_account("alice")
@@ -308,7 +308,7 @@ def test_deposit_increases_balance_and_writes_two_entries():
 # POST /withdraw
 # ---------------------------------------------------------------------------
 
-# Interview: Mirror image of a deposit (DEBIT the customer, CREDIT EXTERNAL); EXTERNAL moves back
+# Mirror image of a deposit (DEBIT the customer, CREDIT EXTERNAL); EXTERNAL moves back
 #   toward zero.
 def test_withdraw_decreases_balance_and_writes_two_entries():
     alice = new_account("alice")
@@ -329,7 +329,7 @@ def test_withdraw_decreases_balance_and_writes_two_entries():
     assert system_balance("EXTERNAL", "USD") == Decimal("-60.00")
 
 
-# Interview: No overdraft, tested at the exact boundary (100.01 vs 100.00). A rejected request is
+# No overdraft, tested at the exact boundary (100.01 vs 100.00). A rejected request is
 #   fully atomic: no transaction or entry rows leak.
 def test_withdraw_insufficient_funds_is_rejected_and_nothing_changes():
     alice = new_account("alice")
@@ -347,7 +347,7 @@ def test_withdraw_insufficient_funds_is_rejected_and_nothing_changes():
 # POST /transactions
 # ---------------------------------------------------------------------------
 
-# Interview: The basic transfer requirement from the spec: atomic, debit source and credit
+# The basic transfer requirement from the spec: atomic, debit source and credit
 #   destination by the same amount, no FX involved (exchange_rate_used is None).
 def test_transfer_same_currency_updates_both_balances_and_writes_two_entries():
     alice, bob = new_account("alice"), new_account("bob")
@@ -370,7 +370,7 @@ def test_transfer_same_currency_updates_both_balances_and_writes_two_entries():
     assert by_type["DEBIT"].amount == by_type["CREDIT"].amount == Decimal("30.00")
 
 
-# Interview: How multi-currency stays balanced: a 4-entry transaction routes through the FX_POSITION
+# How multi-currency stays balanced: a 4-entry transaction routes through the FX_POSITION
 #   accounts so debits equal credits in EACH currency, and the rate used is stored on the transaction
 #   for audit.
 def test_transfer_cross_currency_converts_with_live_rate():
@@ -402,7 +402,7 @@ def test_transfer_cross_currency_converts_with_live_rate():
     assert system_balance("FX_POSITION", "SGD") == Decimal("-54.00")
 
 
-# Interview: The spec's 'reject if insufficient balance' rule, and proof that a rejected transfer
+# The spec's 'reject if insufficient balance' rule, and proof that a rejected transfer
 #   leaves no trace.
 def test_transfer_insufficient_funds_is_rejected_and_nothing_changes():
     alice, bob = new_account("alice"), new_account("bob")
@@ -416,7 +416,7 @@ def test_transfer_insufficient_funds_is_rejected_and_nothing_changes():
     assert count_rows(models.LedgerEntry) == 2
 
 
-# Interview: Boundary case: the check is balance < amount, so sending exactly your whole balance is
+# Boundary case: the check is balance < amount, so sending exactly your whole balance is
 #   allowed and leaves 0.
 def test_transfer_exact_balance_is_allowed():
     alice, bob = new_account("alice"), new_account("bob")
@@ -426,7 +426,7 @@ def test_transfer_exact_balance_is_allowed():
     assert balance_of(alice) == 0 and balance_of(bob) == 50
 
 
-# Interview: Input validation: self-transfer gives 400, unknown source or destination gives 404, and
+# Input validation: self-transfer gives 400, unknown source or destination gives 404, and
 #   nothing is written.
 def test_transfer_rejects_same_or_unknown_account():
     alice = new_account("alice")
@@ -439,7 +439,7 @@ def test_transfer_rejects_same_or_unknown_account():
     assert count_rows(models.Transaction) == 1
 
 
-# Interview: Fail-closed design: if the FX provider is down we refuse rather than guess or reuse an
+# Fail-closed design: if the FX provider is down we refuse rather than guess or reuse an
 #   old rate. Nothing was recorded, so the same idempotency key can be retried safely afterwards.
 def test_transfer_cross_currency_returns_503_when_rate_service_is_down():
     bob_sgd, alice = new_account("bob", "SGD"), new_account("alice")
@@ -458,7 +458,7 @@ def test_transfer_cross_currency_returns_503_when_rate_service_is_down():
     assert balance_of(bob_sgd) == 90 and balance_of(alice) == Decimal("7.40")          # 10 SGD x 0.74
 
 
-# Interview: Cheap validation runs before the network call and before any locks, so a bad request
+# Cheap validation runs before the network call and before any locks, so a bad request
 #   never costs an external API round-trip.
 def test_cross_currency_transfer_below_minimum_is_rejected_before_any_fx_call():
     alice, bob_sgd = new_account("alice"), new_account("bob", "SGD")
@@ -474,7 +474,7 @@ def test_cross_currency_transfer_below_minimum_is_rejected_before_any_fx_call():
     assert count_rows(models.Transaction) == transactions_before
 
 
-# Interview: The FX dependency is isolated to cross-currency transfers, so domestic transfers keep
+# The FX dependency is isolated to cross-currency transfers, so domestic transfers keep
 #   working during an FX outage.
 def test_same_currency_transfer_never_calls_the_rate_service():
     alice, bob = new_account("alice"), new_account("bob")
@@ -488,7 +488,7 @@ def test_same_currency_transfer_never_calls_the_rate_service():
     assert system_balance("FX_POSITION", "USD") == system_balance("FX_POSITION", "SGD") == 0
 
 
-# Interview: Money-safety validation at the API edge: amount must be > 0 with at most 2 decimal
+# Money-safety validation at the API edge: amount must be > 0 with at most 2 decimal
 #   places (422 from Pydantic). Amounts are Decimal in the app and NUMERIC in the DB, never float.
 @pytest.mark.parametrize("bad_amount", [0, -10, 10.005])
 def test_money_endpoints_reject_nonpositive_and_excess_precision_amounts(bad_amount):
@@ -507,7 +507,7 @@ def test_money_endpoints_reject_nonpositive_and_excess_precision_amounts(bad_amo
 # GET /accounts/{id}
 # ---------------------------------------------------------------------------
 
-# Interview: The balance is returned as a string (e.g. "100.00") so JSON clients cannot lose
+# The balance is returned as a string (e.g. "100.00") so JSON clients cannot lose
 #   precision through float conversion.
 def test_get_account_returns_balance_and_currency():
     bob_sgd = new_account("bob", "SGD")
@@ -520,7 +520,7 @@ def test_get_account_returns_balance_and_currency():
     assert client.get(f"/accounts/{bob_sgd}").json()["balance"] == "100.00"
 
 
-# Interview: Only currencies that have system accounts are allowed; otherwise an account could be
+# Only currencies that have system accounts are allowed; otherwise an account could be
 #   created that can never be funded.
 def test_create_account_rejects_unsupported_currency():
     r = client.post("/accounts", json={"owner_name": "eve", "currency": "EUR"})
@@ -540,7 +540,7 @@ def txn_ids(response):
     return [row["transaction_id"] for row in response.json()["results"]]
 
 
-# Interview: The spec asks for history ordered by timestamp. Ties are broken by entry id so the
+# The spec asks for history ordered by timestamp. Ties are broken by entry id so the
 #   order is deterministic, and the list is paginated.
 def test_history_is_newest_first_by_default_and_oldest_first_with_asc():
     alice = new_account("alice")
@@ -553,7 +553,7 @@ def test_history_is_newest_first_by_default_and_oldest_first_with_asc():
     assert history(alice).json()["order"] == "desc"
 
 
-# Interview: History lists ledger ENTRIES, so each account sees its own side of a transfer in its
+# History lists ledger ENTRIES, so each account sees its own side of a transfer in its
 #   own currency (alice -40 USD, bob +54 SGD).
 def test_history_rows_show_type_amount_and_description():
     alice, bob_sgd = new_account("alice"), new_account("bob", "SGD")
@@ -591,7 +591,7 @@ class _FakeResponse:
         return self._body
 
 
-# Interview: The rate is parsed straight into a Decimal (parse_float=Decimal), never a float, so it
+# The rate is parsed straight into a Decimal (parse_float=Decimal), never a float, so it
 #   stays exact. The network is faked; tests never hit the internet.
 def test_real_fetch_parses_frankfurter_response(monkeypatch):
     body = b'{"amount":1.0,"base":"USD","date":"2026-10-27","rates":{"SGD":1.2912}}'
@@ -602,7 +602,7 @@ def test_real_fetch_parses_frankfurter_response(monkeypatch):
     assert rate == Decimal("1.291200") and rate_date == "2026-10-27"   # Decimal, 6 places, not a float
 
 
-# Interview: ROUND_HALF_UP is deliberate: Python's default is banker's rounding (half even), while
+# ROUND_HALF_UP is deliberate: Python's default is banker's rounding (half even), while
 #   half up is the conventional rule for money.
 def test_real_fetch_rounds_the_rate_half_up_to_6_places(monkeypatch):
     # 1.3500005 is exactly half way between 1.350000 and 1.350001. Half up gives 1.350001
@@ -615,7 +615,7 @@ def test_real_fetch_rounds_the_rate_half_up_to_6_places(monkeypatch):
     assert rate == Decimal("1.350001")
 
 
-# Interview: Never trust external data: malformed JSON, a missing rate, zero or a non-number all
+# Never trust external data: malformed JSON, a missing rate, zero or a non-number all
 #   become FxRateError, which the endpoint turns into a 503.
 @pytest.mark.parametrize("body", [b"not json", b'{"rates":{}}', b'{"rates":{"SGD":0}}', b'{"rates":{"SGD":"abc"}}'])
 def test_real_fetch_rejects_bad_responses(monkeypatch, body):
@@ -625,7 +625,7 @@ def test_real_fetch_rejects_bad_responses(monkeypatch, body):
         REAL_FETCH_FX_RATE("USD", "SGD")
 
 
-# Interview: The FX call has a 5-second timeout, and timeouts and HTTP errors fail closed instead of
+# The FX call has a 5-second timeout, and timeouts and HTTP errors fail closed instead of
 #   hanging the request or guessing a rate.
 @pytest.mark.parametrize("failure", ["timeout", "http"])
 def test_real_fetch_reports_timeout_and_http_errors(monkeypatch, failure):
@@ -671,7 +671,7 @@ def entries_of(transaction_id):
         db.close()
 
 
-# Interview: Transactions carry an explicit type enum, so code (e.g. the reversal rules) never has
+# Transactions carry an explicit type enum, so code (e.g. the reversal rules) never has
 #   to parse the description text.
 def test_each_endpoint_records_its_transaction_type():
     alice, bob = new_account("alice"), new_account("bob")
@@ -693,7 +693,7 @@ def post_reverse(transaction_id, key):
     return client.post(f"/transactions/{transaction_id}/reverse", json={"idempotency_key": key})
 
 
-# Interview: Reversals are new offsetting transactions; the original is never edited or deleted
+# Reversals are new offsetting transactions; the original is never edited or deleted
 #   (append-only audit trail). The reversal posts the opposite entry for every original entry.
 def test_reverse_same_currency_transfer_restores_balances():
     alice, bob = new_account("alice"), new_account("bob")
@@ -722,7 +722,7 @@ def test_reverse_same_currency_transfer_restores_balances():
     ]
 
 
-# Interview: Reversal is generic: it flips every entry of the original, so it works for any
+# Reversal is generic: it flips every entry of the original, so it works for any
 #   transaction type, including the EXTERNAL leg.
 def test_reverse_deposit_and_withdrawal():
     alice = new_account("alice")
@@ -736,7 +736,7 @@ def test_reverse_deposit_and_withdrawal():
     assert balance_of(alice) == 0 and system_balance("EXTERNAL", "USD") == Decimal("0.00")
 
 
-# Interview: A reversal reuses the original entry amounts and rate, not today's rate, so FX_POSITION
+# A reversal reuses the original entry amounts and rate, not today's rate, so FX_POSITION
 #   returns exactly to zero. No FX lookup happens during a reversal.
 def test_reverse_cross_currency_transfer_uses_original_amounts_not_todays_rate():
     alice, carol_sgd = new_account("alice"), new_account("carol", "SGD")
@@ -760,7 +760,7 @@ def test_reverse_cross_currency_transfer_uses_original_amounts_not_todays_rate()
     assert sorted(a for _, _, a in entries_of(reversal)) == [Decimal("40.00"), Decimal("40.00"), Decimal("54.00"), Decimal("54.00")]
 
 
-# Interview: A transaction can be reversed only once (409). This is enforced in code and, as a
+# A transaction can be reversed only once (409). This is enforced in code and, as a
 #   backstop, by the UNIQUE constraint on reversal_of.
 def test_reverse_same_transaction_twice_is_rejected_and_moves_nothing():
     alice, bob = new_account("alice"), new_account("bob")
@@ -776,7 +776,7 @@ def test_reverse_same_transaction_twice_is_rejected_and_moves_nothing():
     assert (count_rows(models.Transaction), count_rows(models.LedgerEntry)) == rows_before
 
 
-# Interview: Design choice: to redo a reversed transaction you post a new transfer. Reversing
+# Design choice: to redo a reversed transaction you post a new transfer. Reversing
 #   reversals would create confusing chains.
 def test_cannot_reverse_a_reversal():
     alice, bob = new_account("alice"), new_account("bob")
@@ -789,7 +789,7 @@ def test_cannot_reverse_a_reversal():
     assert balance_of(alice) == 100 and balance_of(bob) == 0
 
 
-# Interview: A reversal must never push a customer below zero. Bob already spent the money, so it is
+# A reversal must never push a customer below zero. Bob already spent the money, so it is
 #   refused with 400 (a real system would need a dispute or chargeback process).
 def test_reverse_is_rejected_when_the_recipient_already_spent_the_money():
     alice, bob = new_account("alice"), new_account("bob")
@@ -805,7 +805,7 @@ def test_reverse_is_rejected_when_the_recipient_already_spent_the_money():
     assert (count_rows(models.Transaction), count_rows(models.LedgerEntry)) == rows_before
 
 
-# Interview: Audit trail: the history shows the reversal as its own row and links back to the
+# Audit trail: the history shows the reversal as its own row and links back to the
 #   original through reversal_of.
 def test_history_shows_type_and_reversal_link():
     alice, bob = new_account("alice"), new_account("bob")
@@ -833,7 +833,7 @@ def _insert_txn(**fields):
         db.close()
 
 
-# Interview: Defence in depth: even if the API code were bypassed or raced, the database UNIQUE
+# Defence in depth: even if the API code were bypassed or raced, the database UNIQUE
 #   constraint still blocks a double reversal.
 def test_database_rejects_a_second_reversal_of_the_same_transaction():
     alice, bob = new_account("alice"), new_account("bob")
@@ -846,7 +846,7 @@ def test_database_rejects_a_second_reversal_of_the_same_transaction():
     assert "UNIQUE" in str(err.value).upper()
 
 
-# Interview: A CHECK constraint keeps type and reversal_of consistent at the database level: only a
+# A CHECK constraint keeps type and reversal_of consistent at the database level: only a
 #   REVERSAL has reversal_of, and every REVERSAL has one.
 def test_database_ties_reversal_of_to_the_reversal_type():
     with pytest.raises(Exception):               # a REVERSAL must say what it reverses

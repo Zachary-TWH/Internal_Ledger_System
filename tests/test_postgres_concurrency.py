@@ -117,7 +117,7 @@ def statuses(responses):
 # Concurrency
 # ---------------------------------------------------------------------------
 
-# Interview: The lost-update problem: each request locks the account row (SELECT ... FOR UPDATE), so
+# The lost-update problem: each request locks the account row (SELECT ... FOR UPDATE), so
 #   20 concurrent +10 deposits queue up and total exactly 200.
 def test_parallel_deposits_to_one_account_lose_no_updates():
     alice = new_account("alice")
@@ -132,7 +132,7 @@ def test_parallel_deposits_to_one_account_lose_no_updates():
     assert entries == 20
 
 
-# Interview: Classic check-then-act race: the balance check happens after the row lock, so exactly
+# Classic check-then-act race: the balance check happens after the row lock, so exactly
 #   10 of the 20 withdrawals succeed and the balance can never go negative.
 def test_parallel_withdrawals_never_overdraw():
     alice = new_account("alice")
@@ -145,7 +145,7 @@ def test_parallel_withdrawals_never_overdraw():
     assert balance_of(alice) == 0
 
 
-# Interview: Deadlock avoidance: locks are always taken in ascending account id order, so A->B and
+# Deadlock avoidance: locks are always taken in ascending account id order, so A->B and
 #   B->A can never end up waiting on each other in a cycle.
 def test_opposite_direction_transfers_do_not_deadlock():
     alice, bob = new_account("alice"), new_account("bob")
@@ -162,7 +162,7 @@ def test_opposite_direction_transfers_do_not_deadlock():
     assert balance_of(alice) == 100 and balance_of(bob) == 100
 
 
-# Interview: Idempotency under a race: the fast-path key check cannot see another request's
+# Idempotency under a race: the fast-path key check cannot see another request's
 #   uncommitted row, so the UNIQUE constraint on idempotency_key is the real guard. Losers get a clean
 #   409.
 def test_identical_simultaneous_requests_move_money_once():
@@ -180,7 +180,7 @@ def test_identical_simultaneous_requests_move_money_once():
     assert rows == 1
 
 
-# Interview: The hidden hotspot is the shared EXTERNAL row: different customers, same system
+# The hidden hotspot is the shared EXTERNAL row: different customers, same system
 #   account. Its row lock prevents lost updates, at the cost of serialising deposits per currency (a
 #   throughput trade-off).
 def test_parallel_deposits_to_different_accounts_lose_no_update_on_external():
@@ -194,7 +194,7 @@ def test_parallel_deposits_to_different_accounts_lose_no_update_on_external():
     assert month_end()["status"] == "RECONCILED"
 
 
-# Interview: The strongest locking test: cross-currency transfers both ways plus deposits and
+# The strongest locking test: cross-currency transfers both ways plus deposits and
 #   withdrawals at once. Lock order (customers by id, then system accounts) prevents deadlocks, and
 #   each currency still nets to 0.
 def test_parallel_conversions_in_both_directions_do_not_deadlock_and_still_sum_to_zero():
@@ -220,7 +220,7 @@ def test_parallel_conversions_in_both_directions_do_not_deadlock_and_still_sum_t
 # Rounding
 # ---------------------------------------------------------------------------
 
-# Interview: Rounding rule: the converted amount is rounded once, half up, to 2 decimals. 13.905
+# Rounding rule: the converted amount is rounded once, half up, to 2 decimals. 13.905
 #   becomes 13.91 (banker's rounding would give 13.90). Needs Postgres because SQLite does not round
 #   NUMERIC.
 @pytest.mark.parametrize("amount, expected_sgd", [
@@ -241,7 +241,7 @@ def test_converted_amount_is_rounded_to_cents(amount, expected_sgd):
     assert credit.amount == Decimal(expected_sgd)
 
 
-# Interview: Rounding cannot create or destroy money: both FX legs use the same rounded amount, so
+# Rounding cannot create or destroy money: both FX legs use the same rounded amount, so
 #   reconciliation still balances to zero.
 def test_month_end_sums_to_zero_after_rounded_conversions():
     alice, bob_sgd = new_account("alice"), new_account("bob", "SGD")
@@ -263,7 +263,7 @@ def reverse(transaction_id, key):
     return post(f"/transactions/{transaction_id}/reverse", {"idempotency_key": key})
 
 
-# Interview: Double-reversal race: the reversal locks the original transaction row, and the UNIQUE
+# Double-reversal race: the reversal locks the original transaction row, and the UNIQUE
 #   reversal_of is the backstop. Exactly one reversal wins; the rest get 409.
 def test_parallel_reversals_of_the_same_transaction_reverse_it_once():
     alice, bob = new_account("alice"), new_account("bob")
@@ -282,7 +282,7 @@ def test_parallel_reversals_of_the_same_transaction_reverse_it_once():
     assert month_end()["status"] == "RECONCILED"
 
 
-# Interview: Reversals take locks in the same order as transfers (customers then system accounts, by
+# Reversals take locks in the same order as transfers (customers then system accounts, by
 #   id), so mixing them with deposits cannot deadlock.
 def test_parallel_reversals_of_conversions_do_not_deadlock_and_still_sum_to_zero():
     alice, bob_sgd = new_account("alice"), new_account("bob", "SGD")
@@ -307,7 +307,7 @@ def test_parallel_reversals_of_conversions_do_not_deadlock_and_still_sum_to_zero
     assert system_balance("FX_POSITION", "SGD") == Decimal("0.00")
 
 
-# Interview: Reversal vs withdrawal racing for the same money: the account row lock serialises them,
+# Reversal vs withdrawal racing for the same money: the account row lock serialises them,
 #   so whichever runs second is refused and Bob never goes negative.
 def test_reversal_and_spend_race_never_leaves_the_recipient_negative():
     alice, bob = new_account("alice"), new_account("bob")
