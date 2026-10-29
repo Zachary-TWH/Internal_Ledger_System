@@ -91,6 +91,7 @@ app = FastAPI()
 # Tables are created by app/create_table.py (run by entrypoint.sh before the API starts),
 # not here. Outside Docker, run `python -m app.create_table` once first.
 
+
 def get_db():
     """FastAPI dependency: one DB session per request, always closed."""
     db = SessionLocal()
@@ -112,7 +113,7 @@ def flush_or_409(db: Session):
     the session is rolled back, which releases every row lock taken so far.
     """
     try:
-        db.flush() 
+        db.flush()
     except IntegrityError:
         db.rollback()
         raise HTTPException(status_code=409, detail="Duplicate request")
@@ -168,6 +169,7 @@ def validate_amount(value: Decimal) -> Decimal:
 # ---------------------------------------------------------------------------
 # Request / response schemas (Pydantic validates incoming JSON against these)
 # ---------------------------------------------------------------------------
+
 
 class AccountCreate(BaseModel):
     """Body of POST /accounts. `currency` is case-insensitive ("sgd" is stored as "SGD") and defaults to USD."""
@@ -242,14 +244,14 @@ class ReversalRequest(BaseModel):
 # Endpoints
 # ---------------------------------------------------------------------------
 
+
 @app.post("/accounts", response_model=AccountOut)
 def create_account(account: AccountCreate, db: Session = Depends(get_db)):
-    """Create a customer account with a zero balance.
-    """
+    """Create a customer account with a zero balance."""
     new_account = models.Account(
         owner_name=account.owner_name,
         currency=account.currency,
-        balance=Decimal("0")
+        balance=Decimal("0"),
     )
     db.add(new_account)
     db.commit()
@@ -282,13 +284,13 @@ def deposit(req: DepositRequest, db: Session = Depends(get_db)):
         transaction_id=txn.id,
         account_id=external.id,
         entry_type=models.EntryType.DEBIT,
-        amount=req.amount
+        amount=req.amount,
     )
     credit_entry = models.LedgerEntry(
         transaction_id=txn.id,
         account_id=account.id,
         entry_type=models.EntryType.CREDIT,
-        amount=req.amount
+        amount=req.amount,
     )
     db.add_all([debit_entry, credit_entry])
 
@@ -329,13 +331,13 @@ def withdraw(req: WithdrawalRequest, db: Session = Depends(get_db)):
         transaction_id=txn.id,
         account_id=account.id,
         entry_type=models.EntryType.DEBIT,
-        amount=req.amount
+        amount=req.amount,
     )
     credit_entry = models.LedgerEntry(
         transaction_id=txn.id,
         account_id=external.id,
         entry_type=models.EntryType.CREDIT,
-        amount=req.amount
+        amount=req.amount,
     )
     db.add_all([debit_entry, credit_entry])
 
@@ -433,7 +435,7 @@ def transfer(req: TransferRequest, db: Session = Depends(get_db)):
         idempotency_key=req.idempotency_key,
         type=models.TransactionType.TRANSFER,
         description="Transfer",
-        exchange_rate_used=exchange_rate_used
+        exchange_rate_used=exchange_rate_used,
     )
     db.add(txn)
     flush_or_409(db)  # get txn.id without committing yet
@@ -468,7 +470,7 @@ def transfer(req: TransferRequest, db: Session = Depends(get_db)):
         "transaction_id": txn.id,
         "exchange_rate_used": str(exchange_rate_used) if exchange_rate_used is not None else None,
         "from_account_new_balance": money_str(from_account.balance),
-        "to_account_new_balance": money_str(to_account.balance)
+        "to_account_new_balance": money_str(to_account.balance),
     }
 
 
@@ -581,8 +583,15 @@ def get_account(account_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Account not found")
     return account
 
+
 @app.get("/accounts/{account_id}/transactions")
-def get_transactions(account_id: int, db: Session = Depends(get_db), page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100), order: Literal["asc", "desc"] = "desc",):
+def get_transactions(
+    account_id: int,
+    db: Session = Depends(get_db),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    order: Literal["asc", "desc"] = "desc",
+):
     """Return an account's ledger entries, paginated like a bank statement.
 
     Ordered by the transaction's created_at, then entry id ("desc" = newest first, the default).
@@ -616,25 +625,26 @@ def get_transactions(account_id: int, db: Session = Depends(get_db), page: int =
     for entry in entries:
         result.append({
             "transaction_id": entry.transaction_id,
-            "type": entry.transaction.type,                # DEPOSIT, WITHDRAWAL, TRANSFER or REVERSAL
+            "type": entry.transaction.type,  # DEPOSIT, WITHDRAWAL, TRANSFER or REVERSAL
             "reversal_of": entry.transaction.reversal_of,  # id of the undone transaction, else null
-            "entry_type": entry.entry_type,   # DEBIT or CREDIT
+            "entry_type": entry.entry_type,  # DEBIT or CREDIT
             "amount": money_str(entry.amount),
             "description": entry.transaction.description,  # e.g. "Deposit", "Withdrawal", "Transfer"
-            "created_at": entry.transaction.created_at
+            "created_at": entry.transaction.created_at,
         })
 
     return {
         "page": page,
         "page_size": page_size,
         "order": order,
-        "results": result
+        "results": result,
     }
 
 
 # ---------------------------------------------------------------------------
 # Month-end reconciliation
 # ---------------------------------------------------------------------------
+
 
 def _money(value) -> Decimal:
     """Round a database sum to 2 decimal places. None (a sum over no rows) counts as 0.00."""
@@ -654,7 +664,7 @@ def month_end_reconciliation(month: str, db: Session = Depends(get_db)):
     except ValueError:
         raise HTTPException(status_code=400, detail="month must be in YYYY-MM format, e.g. 2026-10")
     next_month_start = datetime(
-        month_start.year + month_start.month // 12,   # December rolls over to January of next year
+        month_start.year + month_start.month // 12,  # December rolls over to January of next year
         month_start.month % 12 + 1,
         1,
     )
@@ -694,7 +704,7 @@ def month_end_reconciliation(month: str, db: Session = Depends(get_db)):
 
     accounts_report = []
     mismatched = 0
-    per_currency = {}   # currency -> running totals of STORED balances, for check 2
+    per_currency = {}  # currency -> running totals of STORED balances, for check 2
     for account, credits_all, debits_all, credits_before, debits_before, credits_month, debits_month in rows:
         # stored = live accounts.balance; ledger_balance = credits - debits over ALL entries.
         # opening / month_credits / month_debits only count entries before / inside the month.
@@ -703,7 +713,7 @@ def month_end_reconciliation(month: str, db: Session = Depends(get_db)):
         opening = _money(credits_before) - _money(debits_before)
         month_credits = _money(credits_month)
         month_debits = _money(debits_month)
-        difference = stored - ledger_balance      # 0.00 when the account reconciles
+        difference = stored - ledger_balance  # 0.00 when the account reconciles
 
         if difference != 0:
             status = "MISMATCH"

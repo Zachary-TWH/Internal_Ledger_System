@@ -18,6 +18,7 @@ SYSTEM_CURRENCIES = ["SGD", "USD"]
 # One of each per supported currency (README assumption 6).
 SYSTEM_ACCOUNT_NAMES = ["EXTERNAL", "FX_POSITION"]
 
+
 def main():
     """Create any missing tables, then seed any missing system accounts."""
     # Creates only missing tables and never alters or drops one, so a changed column needs a migration.
@@ -43,6 +44,7 @@ def main():
     finally:
         db.close()
     print("Tables and system accounts ready.")
+
 
 if __name__ == "__main__":
     main()

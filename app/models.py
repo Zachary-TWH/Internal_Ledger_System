@@ -63,6 +63,7 @@ class Account(Base):
     )
     is_system = Column(Boolean, nullable=False, default=False)
 
+
 class Transaction(Base):
     """A business event grouping related ledger entries. Append-only (README assumption 5).
 
