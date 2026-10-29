@@ -24,7 +24,7 @@ To run it: `docker compose up --build`. Details are under [Quick start](#quick-s
 4. [API at a glance](#api-at-a-glance)
 5. [Behaviour](#behaviour)
 6. [Walkthrough](#walkthrough-deposit-withdraw-transfer-and-reversal)
-7. [Known limitations and how I would solve them](#known-limitations-and-how-i-would-solve-them) (includes caching)
+7. [Known limitations and how I would solve them](#known-limitations-and-how-i-would-solve-them)
 8. [Running and testing it](#running-and-testing-it): [Quick start](#quick-start), [Tests and CI](#tests-and-ci), [Project layout](#project-layout), [Local configuration](#local-configuration)
 
 ## Requirements checklist
