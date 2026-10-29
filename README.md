@@ -35,7 +35,7 @@ Where each item of the assignment is covered.
 |-------------|--------|-------|
 | `POST /transactions` with source, destination, amount, recorded atomically, returns transaction id | Done | [API at a glance](#api-at-a-glance), behaviour 4 |
 | `GET /accounts/{id}` returns the current balance | Done | [API at a glance](#api-at-a-glance) |
-| `GET /accounts/{id}/transactions` returns history ordered by timestamp | Done | Newest first by default, `order=asc` for oldest first. Ties broken by entry id so pages never overlap |
+| `GET /accounts/{id}/transactions` returns history ordered by timestamp | Done | Newest first by default, `order=asc` for oldest first. Timestamp ties are ordered by entry id; page contents can shift when new entries arrive |
 | Transfer is one atomic operation, rejected on insufficient balance | Done | Behaviours 9 and 16 |
 | Transactions can be reversed (posted as a reversal) | Done | Walkthrough, "Reversal rules" |
 | Repeated submission does not cause extra transfers | Done | Behaviour 11 |
@@ -150,7 +150,7 @@ Each item is a problem that money systems hit, what a simple approach would do, 
 
 ## API at a glance
 
-Every write takes a unique `idempotency_key`. Amounts are sent as strings such as `"10.50"` (numbers also work) and come back as 2-decimal strings.
+Every money-moving write (deposit, withdrawal, transfer or reversal) takes a unique `idempotency_key`; account creation is not idempotent, so retrying it creates another account. Amounts are sent as strings such as `"10.50"` (numbers also work) and come back as 2-decimal strings.
 
 | Method and path | What it does | Success response |
 |-----------------|--------------|------------------|
@@ -256,19 +256,12 @@ Each item below is a rule the ledger follows. Examples use made-up numbers.
 
 **10. Concurrent requests are serialised per account.**
 - In the Python code, SQLAlchemy's `.with_for_update()` adds a row lock to the query; PostgreSQL executes it as `SELECT ... FOR UPDATE`. The request waits if another transaction already holds a lock on that account, then checks the latest committed balance.
-- A transfer locks both accounts in ascending ID order.
-- Example: A to B and B to A at the same time both lock the lower ID first, so they cannot deadlock.
-- System accounts are locked too, always after the customer rows and, for the two FX_POSITION rows, in ascending ID order. Every request therefore takes its locks in the same order and cannot deadlock.
-- Trade-off: every deposit and withdrawal in a currency locks that currency's single EXTERNAL row, and every cross-currency transfer locks both FX_POSITION rows. Those requests run one after another, even for different customers. That is fine at this scale. A fix would be to split each system account into several sub-accounts and sum them.
+- Transfers lock customer accounts by ascending ID, then system accounts by ascending ID. This prevents deadlocks, but shared EXTERNAL and FX_POSITION rows serialize some otherwise unrelated writes; splitting them into sub-accounts could improve throughput.
 
-**11. Idempotency keys are required on every write.**
-- `POST /transactions` is the transfer: source, destination, and amount. `POST /deposit` and `POST /withdraw` fund and drain accounts through the EXTERNAL account.
-- Deposit, withdrawal, reversal and transfer all take an `idempotency_key`.
-- The key is saved on the transaction. The database column has a unique constraint, a rule that no two rows can hold the same key.
-- A reused key returns 200 with `{"transaction_id": <original id>, "status": "already_processed"}` and moves no money.
-- Example: a client retries `transfer-001` after a timeout. It gets the id of the first attempt back, so it knows the transfer worked and the money moved once.
-- Two identical requests arriving at the same moment can both pass the up-front check. The unique constraint then rejects the loser, and the API turns that into a clean 409 (never a 500). The client's next retry gets the 200 above.
-- Limit: only the transaction id is returned, not the full original response, and nothing checks whether the retry had the same details.
+**11. Idempotency keys are required on every money-moving write.**
+- Deposits, withdrawals, transfers and reversals store the required key under a database unique constraint. Reusing a key returns the original transaction ID with `already_processed` and does not move money.
+- If identical requests race, the unique constraint prevents a duplicate; the losing request may receive 409, and a later retry returns the original ID.
+- The replay does not return the full original response or verify that the new request has the same details. Account creation is not idempotent (see the limitations table).
 
 **12. Timestamps use the database server clock.**
 - `created_at` is stored without a timezone.
@@ -290,15 +283,9 @@ Each item below is a rule the ledger follows. Examples use made-up numbers.
 - **Check 1: each account against its own entries.** Ledger balance = the account's CREDIT entries minus its DEBIT entries. It must equal the stored `accounts.balance`. `difference` is stored minus ledger, so `0.00` means reconciled. System accounts are included, because their balances move with every entry.
 - Example: Alice has CREDIT 100 and DEBIT 40, so her ledger balance is 60. If her stored balance is 70, the difference is `10.00` and she is a `MISMATCH`.
 - **Check 2: each currency adds up to zero.** Every transaction's entries net to zero within each currency, so the stored balances in one currency (customers, EXTERNAL and FX_POSITION) must sum to `0.00`.
-- Example: Alice deposits 100 USD, withdraws 40, then converts 50 USD to 67.50 SGD for Bob. USD: Alice +10.00, EXTERNAL -60.00, FX_POSITION +50.00, sum 0.00. SGD: Bob +67.50, FX_POSITION -67.50, sum 0.00. Without the FX legs (behaviour 8), USD would sum to -50.00 and SGD to +67.50.
 - **The response** has one row per currency (`customers_total`, `external_total`, `fx_position_total`, `net`, `status`), one row per account (stored, ledger, difference, status, plus the month's opening, credits, debits and closing), a `summary`, `month_has_ended`, and an overall `status` of `RECONCILED` or `OUT_OF_BALANCE`. HTTP 200 either way, so read `status`. An invalid month returns 400.
 - **Consistent under live traffic.** Every balance and ledger sum is read in one SQL statement, so Postgres gives them the same snapshot. A transfer committing mid-report cannot cause a false result.
-- **Limits** (fixes are in the limitations table below):
-  - The `month` parameter labels and groups activity, but balances are live. There are no saved snapshots, so it cannot reproduce a past month after later transactions.
-  - It reads the whole ledger on every call. Check 1 needs every entry ever posted, and the opening balance is recomputed from every entry before the month, so a call for one month still sums all the history. With 10 years of entries it scans all 10 years for every account, and it gets slower as the ledger grows. This is fine at this scale. I would fix it with monthly snapshots (see the limitations table).
-  - It does not check that each transaction's own entries balance, or that the stored rate matches the amounts.
-  - It compares the ledger with itself. It cannot see money that never reached the ledger, or a difference from a real bank statement.
-  - Offsetting errors (one account 10 too high, another 10 too low) still sum to zero in check 2, but check 1 flags both accounts.
+- **Limits:** balances are live and every report scans the full ledger, so past months cannot be reproduced and calls get slower as history grows. The report cannot detect off-ledger discrepancies or independently verify each transaction; see the limitations table.
 
 **16. Every write is atomic: all of it is saved, or none of it.**
 - This covers every write endpoint: account creation, deposit, withdrawal, transfer and reversal. Each request runs in one database transaction and calls `commit()` once, at the end.
@@ -373,12 +360,8 @@ This walkthrough follows one example through the three tables. Account IDs assum
 | 5 reversal | -80 | 0 | 0 | 50 | 30 | 0 |
 
 **What to notice**
-- **Deposit and withdraw:** two entries each. EXTERNAL USD mirrors the customer (-100, then -80).
-- **Same-currency transfer:** two entries, and the rate is null.
-- **FX transfer:** four entries, split by currency. USD: 40 out of Alice and into FX USD. SGD: 54 out of FX SGD and into Carol.
-- **Reversal (transaction 5):** it copies transaction 4's four entries with DEBIT and CREDIT swapped (entries 11 to 14). It uses the original 40.00 and 54.00, not today's rate.
-- **Append-only:** nothing is edited or deleted. Transaction 4 and its entries are untouched. A mistake is fixed by adding a new transaction.
-- **Each currency still nets to zero:** USD is -80 + 0 + 50 + 30 = 0. SGD is 0 + 0 + 0 = 0.
+- **Reversal:** transaction 5 swaps transaction 4's entry directions and reuses its original amounts and rate; nothing in the original transaction is edited.
+- The tables show deposits and withdrawals through EXTERNAL, same-currency transfers with two entries, and FX transfers with four entries through FX_POSITION.
 
 **Reversal rules (`POST /transactions/{id}/reverse`)**
 
@@ -389,7 +372,6 @@ This walkthrough follows one example through the three tables. Account IDs assum
 | Reverse transaction 5 | 400 | its type is REVERSAL |
 | Reverse transaction 1 (the 100 USD deposit) | 400 | Alice only has 50.00, so undoing it would take her below zero |
 | Reverse transaction 99 | 404 | no such transaction |
-| Reuse an idempotency key | 200 | the key was already used, so the original `transaction_id` comes back with `status: already_processed` and nothing is posted |
 
 - **Why `type` and `reversal_of`:** code checks the `type` column, not the free-text description. `reversal_of` is unique, so the database itself blocks a second reversal even if two requests race. A check constraint ties the two together: only a REVERSAL has a `reversal_of`, and every REVERSAL has one.
 - **Recipient already spent the money:** the reversal is refused (400). A real system would use a dispute or compensating process, which this API does not provide.
@@ -402,6 +384,7 @@ These are deliberate simplifications. Each one is a gap I know about, with the f
 | Limitation | Fix I would make |
 |------------|------------------|
 | A duplicate request returns only the original transaction id, not the full response, and a retry with different details is not detected | Store the response and a hash of the request body with the key. Return the stored response when the hash matches, and a 422 when it does not |
+| Account creation is not idempotent; retrying `POST /accounts` creates another account | Accept an idempotency key and return the original account when the same request is retried |
 | Month-end reads live balances, so a past month cannot be reproduced. It also sums the whole ledger on every call, so it gets slower as history grows | I would add a monthly snapshot. A write-once `account_snapshots` table (`account_id`, `month`, `closing_balance`, `last_entry_id`), written by a scheduled job right after the check reports `RECONCILED`. Summing one month's snapshots per currency must give 0.00. The report would then start from the last snapshot (its `closing_balance` is the opening balance) and sum only the entries after its `last_entry_id`, so the cost depends on one month of activity and not on the whole history |
 | Reconciliation does not check each transaction | One query grouping entries by transaction and currency, flagging any group where debits differ from credits |
 | Reconciliation compares the ledger with itself | Import the real bank or custodian statement and compare its totals with EXTERNAL |
