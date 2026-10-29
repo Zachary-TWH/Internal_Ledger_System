@@ -301,10 +301,23 @@ Each item below is a rule the ledger follows. Examples use made-up numbers.
   - It compares the ledger with itself. It cannot see money that never reached the ledger, or a difference from a real bank statement.
   - Offsetting errors (one account 10 too high, another 10 too low) still sum to zero in check 2, but check 1 flags both accounts.
 
-**16. A transfer is atomic: all of it happens, or none of it.**
-- A transfer writes its transaction row, its ledger entries and the balance updates inside one database transaction, with a single `commit()` at the very end. Nothing is saved before that, and other requests see none of it until then.
-- If anything fails before the commit (insufficient funds, a duplicate key, a crash), the uncommitted work is rolled back, so a partial transfer is never saved.
-- The funds check runs after the accounts are locked and before anything is written (see 9 and 10), so a rejected transfer writes nothing.
+**16. Every write is atomic: all of it is saved, or none of it.**
+- This covers every write endpoint: account creation, deposit, withdrawal, transfer and reversal. Each request runs in one database transaction and calls `commit()` once, at the end.
+- `db.flush()` sends the transaction row's INSERT to Postgres early, so the row gets its id and the unique `idempotency_key` check fires straight away (`flush_or_409`). A flush is not a commit: other requests cannot see the row, and it is undone if the request fails later.
+- The ledger entries and balance updates are sent together with the final commit.
+- Any failure before the commit (insufficient funds, a duplicate key, a crash) rolls everything back, including what was flushed. `get_db` also closes the session in its `finally` block, which discards anything uncommitted.
+- The funds check runs after the accounts are locked and before anything is written (see 9 and 10), so a rejected request writes nothing.
+- From `deposit` in `app/main.py` (the other writes follow the same shape):
+
+```python
+db.add(txn)
+flush_or_409(db)               # INSERT sent now to get txn.id and test the unique key. Not committed.
+db.add_all([debit_entry, credit_entry])
+account.balance += req.amount
+external.balance -= req.amount
+commit_or_409(db)              # the one COMMIT: transaction, entries and balances saved together
+```
+
 - Example: Alice sends 30.00 to Bob. If posting Bob's credit fails, Alice is not debited and no entry exists.
 
 ## Walkthrough: deposit, withdraw, transfer and reversal
