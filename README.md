@@ -54,9 +54,40 @@ Where each item of the assignment is covered.
 accounts 1 ---- * ledger_entries * ---- 1 transactions
 ```
 
-- **accounts:** `id`, `owner_name`, `currency`, `balance NUMERIC(18,2)`, `is_system`. Includes 4 system accounts: EXTERNAL and FX_POSITION, one of each per currency.
-- **transactions:** `id`, `idempotency_key` (unique), `type` (DEPOSIT, WITHDRAWAL, TRANSFER, REVERSAL), `reversal_of` (unique), `exchange_rate_used`, `created_at`. One row per business event.
-- **ledger_entries:** `transaction_id`, `account_id`, `entry_type` (DEBIT or CREDIT), `amount` (always positive). The source of truth.
+**accounts**: one row per account. Includes 4 system accounts (EXTERNAL and FX_POSITION, one of each per currency).
+
+| Column | Type | Null | Key / constraint | Meaning |
+|--------|------|------|------------------|---------|
+| `id` | Integer | no | primary key | Account id |
+| `owner_name` | String | no | | Free text, not unique |
+| `currency` | String | no | | USD or SGD, fixed at creation (default USD) |
+| `balance` | NUMERIC(18,2) | no | | Stored copy of the ledger (default 0). A customer balance never goes below zero, enforced in the application |
+| `is_system` | Boolean | no | | True for EXTERNAL and FX_POSITION, false for customer accounts |
+
+**transactions**: one row per business event.
+
+| Column | Type | Null | Key / constraint | Meaning |
+|--------|------|------|------------------|---------|
+| `id` | Integer | no | primary key | Transaction id |
+| `idempotency_key` | String | yes (the API always sets it) | unique, indexed | Stops a repeated request from running twice |
+| `type` | Enum | no | | DEPOSIT, WITHDRAWAL, TRANSFER or REVERSAL |
+| `reversal_of` | Integer | yes | foreign key to `transactions.id`, unique | The transaction a REVERSAL undoes. Unique, so a transaction can be reversed once |
+| `description` | String | yes | | Human-readable label, never used for logic |
+| `created_at` | DateTime, no timezone | yes | database default `now()` | Database server clock |
+| `notes` | String | yes | | Optional free text, no endpoint sets it yet |
+| `exchange_rate_used` | NUMERIC(18,6) | yes | | Rate applied to a cross-currency transfer, null otherwise |
+
+Check constraint: only a REVERSAL has a `reversal_of`, and every REVERSAL has one.
+
+**ledger_entries**: one row per debit or credit posting. The source of truth.
+
+| Column | Type | Null | Key / constraint | Meaning |
+|--------|------|------|------------------|---------|
+| `id` | Integer | no | primary key | Entry id |
+| `transaction_id` | Integer | no | foreign key to `transactions.id` | The transaction this entry belongs to |
+| `account_id` | Integer | no | foreign key to `accounts.id` | The account posted to |
+| `entry_type` | Enum | no | | DEBIT or CREDIT |
+| `amount` | NUMERIC(18,2) | no | check: greater than 0 | Always positive, in the currency of the account. The direction is in `entry_type` |
 
 **What one write does, with numbers.** Alice (USD, balance 100.00) transfers 30.00 to Bob (USD, balance 0.00):
 
@@ -157,7 +188,6 @@ Each item below is a rule the ledger follows. Examples use made-up numbers.
 **2. Supported currencies.**
 - Currently supported currencies are USD and SGD.
 - Both use two decimal places, so `NUMERIC(18,2)` is sufficient for stored monetary amounts within the supported range.
-- Additional currencies are not currently supported.
 - Currencies such as KRW and JPY, which commonly use zero-decimal payment amounts, and IDR, which commonly uses whole-rupiah amounts, require currency-specific precision and validation rules.
 - Support can be added by introducing currency-specific metadata and business rules.
 
@@ -191,7 +221,6 @@ Each item below is a rule the ledger follows. Examples use made-up numbers.
 **7. Transfer amount is in the source account's currency.**
 - Same currency: destination gets the same amount. The FX service is never called.
 - Different currency: the live rate (source to destination) is fetched from the Frankfurter API when the transfer runs, and the destination gets the amount times that rate, rounded to 2 decimals (half up).
-- Example: send 100 USD at 1.35. The destination receives 135.00 SGD.
 - **Rounding.** The fetched rate is rounded to 6 decimals (half up), the same scale it is stored at. The converted amount is the exact product (amount x rate) rounded once to 2 decimals (half up), with no rounding in between.
 - **Minimum cross-currency transfer: 10 in the source currency** (400 below that, checked before the FX call or any lock). A tiny amount at a low rate could otherwise round to 0.00 and break the ledger's `amount > 0` rule. At 10 or more, the converted amount stays positive for any rate above 0.0005. Same-currency transfers have no minimum beyond 0.01.
 - There is **no exchange-rate table**. Only the rate that was actually executed is stored, on the transaction (`exchange_rate_used`, 6 decimals). The rate used is the rate saved, and later rate moves never alter history.
@@ -199,12 +228,12 @@ Each item below is a rule the ledger follows. Examples use made-up numbers.
 - **The rate is fetched before any row lock is taken** (after the idempotency check). A slow or hanging FX service therefore never holds up other transfers on those accounts. The only thing read before locking is the account currencies, which never change after creation. Balances are only read after the lock.
 - Only the direct pair is used. No inverse rates, no triangulation.
 
-**FX service assumption.** Frankfurter stands in for the internal rates service a real system would call. The ledger assumes that service is available and returns a sensible rate. Frankfurter publishes European Central Bank reference rates once per working day (about 16:00 CET), so on weekends the last working-day rate is returned. It is free and has no uptime guarantee, which is acceptable here. If the service does fail, the transfer fails closed (503) rather than guessing a rate.
+**FX service assumption.** The rate comes from an internal rates API, as it would in a real system. Frankfurter is used here only as a stand-in. That API's uptime is the owning team's concern, so the ledger assumes it is available close to 100% of the time. If a call does fail, the transfer fails closed (503) and nothing is recorded.
+
+**Spread and margin assumption.** The rate returned by that internal API is assumed to already include any spread or margin, agreed with the treasury team. The ledger applies the rate as given.
 
 **Not implemented (FX).**
 - No quote-then-confirm step. The customer cannot see the rate before the transfer runs, because the rate is chosen at execution. I would add a short-lived quote (id, rate, expiry) that the transfer must reference, so the customer agrees to a specific rate.
-- No spread or fee on the rate.
-- No fallback provider. A second provider, tried only when the first fails, would raise availability without ever using an old rate.
 - No retries. A single 5 second attempt keeps the request short, and the client can retry.
 - No check on rate age. Frankfurter returns a `date`, and a production system should reject a rate older than an agreed limit (for example more than 4 days, which still covers a long weekend).
 
@@ -226,7 +255,6 @@ Each item below is a rule the ledger follows. Examples use made-up numbers.
 - Example: A to B and B to A at the same time both lock the lower ID first, so they cannot deadlock.
 - System accounts are locked too, always after the customer rows and, for the two FX_POSITION rows, in ascending ID order. Every request therefore takes its locks in the same order and cannot deadlock.
 - Trade-off: every deposit and withdrawal in a currency locks that currency's single EXTERNAL row, and every cross-currency transfer locks both FX_POSITION rows. Those requests run one after another, even for different customers. That is fine at this scale. A fix would be to split each system account into several sub-accounts and sum them.
-- This needs Postgres. SQLite ignores row locks, so concurrency is only meaningful on Postgres.
 
 **11. Idempotency keys are required on every write.**
 - `POST /transactions` is the transfer: source, destination, amount. The spec does not say how money enters the system, so `POST /deposit` and `POST /withdraw` fund and drain accounts through the EXTERNAL account.
@@ -355,7 +383,7 @@ These are deliberate simplifications. Each one is a gap I know about, with the f
 | Reconciliation does not check each transaction | One query grouping entries by transaction and currency, flagging any group where debits differ from credits |
 | Reconciliation compares the ledger with itself | Import the real bank or custodian statement and compare its totals with EXTERNAL |
 | EXTERNAL and FX_POSITION are hot rows, so deposits, withdrawals and conversions in one currency run one after another | Split each system account into several sub-accounts and sum them |
-| Exchange rate is a daily ECB reference rate from a free service, with no quote step, spread, fallback or age check | A paid quote feed, a short-lived quote the transfer must reference, a second provider, and rejection of rates older than an agreed limit (behaviour 7) |
+| Exchange rate is a daily ECB reference rate from a free service, with no quote step, fallback or age check | A paid quote feed, a short-lived quote the transfer must reference, a second provider, and rejection of rates older than an agreed limit (behaviour 7) |
 | A reversal is refused when the recipient already spent the money | A dispute or compensating-transfer process |
 | No authentication or ownership checks | Authenticate callers and check that they own the source account |
 | `created_at` has no timezone and uses the database server clock | `timestamptz`, stored in UTC |
