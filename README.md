@@ -238,8 +238,8 @@ CI (`.github/workflows/ci.yml`) runs both test suites on pushes to `main`, pull 
 
 ## Local configuration
 
-Copy `.env.example` to `.env` and replace the placeholder password with a local-only value. Keep `.env` untracked; it is ignored by Git. Run `docker compose up --build` from the repository root to start the database and API. Docker Compose requires `POSTGRES_PASSWORD` to be set and passes the database URL to the API.
+Create a local `.env` file in the repository root with `POSTGRES_PASSWORD` set to a local development password. Keep this file untracked; Git ignores it. Docker Compose uses this value for the database and API connection. Run `docker compose up --build` to start the stack.
 
-For a local app process outside Docker, set `DATABASE_URL` to a PostgreSQL connection URL in `.env` or the environment. The example uses the same password for both variables; if you change it, keep them in sync. Use a URL-safe password or percent-encode special characters in the connection URL.
+When running the API outside Docker, also set `DATABASE_URL` to a PostgreSQL connection URL for your local database. Use a URL-safe password or percent-encode special characters in the URL.
 
-These credentials are for local development only. A real deployment should inject secrets through its platform or a secrets manager, not commit them to source control.
+These credentials are for local development only. Do not commit passwords; a real deployment should inject secrets through its platform or a secrets manager.
