@@ -1,5 +1,172 @@
 # Internal Ledger System
 
+A small ledger API for recording money movements between accounts and keeping balances correct. Built with FastAPI, SQLAlchemy and PostgreSQL, and run with Docker Compose.
+
+The core idea: **every movement is a transaction made of balanced DEBIT and CREDIT entries.** Entries are never edited or deleted, so the ledger is the source of truth and the stored account balance is a fast copy of it. A mistake is fixed by posting a new reversal transaction.
+
+## What the system can do
+
+- **Accounts:** create accounts in USD or SGD. Each account has one fixed currency and starts at 0.00.
+- **Deposit and withdraw:** money enters and leaves the system through an internal EXTERNAL account. No overdrafts.
+- **Transfer:** move money between two accounts, atomically. Across two currencies, the live exchange rate is applied.
+- **Reverse:** undo a transaction by posting an offsetting reversal. Nothing is edited or deleted.
+- **Query:** read an account's balance and its paginated transaction history.
+- **Reconcile:** a month-end report checks every stored balance against the ledger, and checks that each currency adds up to zero.
+- **Stay safe under retries and concurrency:** idempotency keys stop a repeated request from moving money twice, and row locks keep simultaneous requests from losing updates or deadlocking.
+
+## Contents
+
+1. [Quick start](#quick-start)
+2. [API at a glance](#api-at-a-glance)
+3. [Requirements checklist](#requirements-checklist)
+4. [How it works](#how-it-works)
+5. [Assumptions](#assumptions)
+6. [Walkthrough](#walkthrough-deposit-withdraw-transfer-and-reversal)
+7. [Month-end reconciliation](#month-end-reconciliation-implemented)
+8. [Known limitations and how I would solve them](#known-limitations-and-how-i-would-solve-them)
+9. [Caching (not implemented)](#caching-not-implemented)
+10. [Tests and CI](#tests-and-ci)
+11. [Project layout](#project-layout)
+12. [Local configuration](#local-configuration)
+
+## Quick start
+
+**Needs:** Docker with Compose. Cross-currency transfers also need internet access, because the exchange rate comes from the Frankfurter API (without it they return 503, everything else still works).
+
+**1. Create a `.env` file** in the repository root. It is not committed. Any password works for local use:
+
+```
+POSTGRES_PASSWORD=dev-password
+```
+
+**2. Start the stack:**
+
+```
+docker compose up --build
+```
+
+This starts PostgreSQL and the API. On start-up the API creates the tables and the 4 system accounts (safe to re-run). The API is at `http://localhost:8000`, and interactive docs are at `http://localhost:8000/docs`.
+
+**3. Try it.** On a fresh database, ids 1 to 4 are the system accounts, so the first customer account is 5.
+
+```
+# Alice (USD, id 5), Bob (USD, id 6), Carol (SGD, id 7)
+curl -s -X POST localhost:8000/accounts -H 'Content-Type: application/json' -d '{"owner_name":"Alice","currency":"USD"}'
+curl -s -X POST localhost:8000/accounts -H 'Content-Type: application/json' -d '{"owner_name":"Bob","currency":"USD"}'
+curl -s -X POST localhost:8000/accounts -H 'Content-Type: application/json' -d '{"owner_name":"Carol","currency":"SGD"}'
+
+# deposit 100.00 USD into Alice
+curl -s -X POST localhost:8000/deposit -H 'Content-Type: application/json' \
+  -d '{"account_id":5,"amount":"100.00","idempotency_key":"dep-001"}'
+
+# transfer 30.00 USD from Alice to Bob
+curl -s -X POST localhost:8000/transactions -H 'Content-Type: application/json' \
+  -d '{"from_account_id":5,"to_account_id":6,"amount":"30.00","idempotency_key":"txn-001"}'
+
+# transfer 40.00 USD from Alice to Carol (USD to SGD, live rate)
+curl -s -X POST localhost:8000/transactions -H 'Content-Type: application/json' \
+  -d '{"from_account_id":5,"to_account_id":7,"amount":"40.00","idempotency_key":"txn-002"}'
+
+# reverse the Bob transfer (transaction 2; the deposit was transaction 1)
+curl -s -X POST localhost:8000/transactions/2/reverse -H 'Content-Type: application/json' \
+  -d '{"idempotency_key":"rev-001"}'
+
+# balance, history, and the month-end report (use the current month)
+curl -s localhost:8000/accounts/5
+curl -s localhost:8000/accounts/5/transactions
+curl -s "localhost:8000/reconciliation/month-end?month=2026-10"
+```
+
+Repeat the first deposit command unchanged. You get a 409 and the balance does not change: that is the idempotency key doing its job.
+
+**Reset to an empty database:** `docker compose down -v`.
+
+**Without Docker:** install `requirements.txt`, set `DATABASE_URL` to a PostgreSQL URL, run `python -m app.create_table` once, then `uvicorn app.main:app`. See [Local configuration](#local-configuration).
+
+## API at a glance
+
+Every write takes a unique `idempotency_key`. Amounts are sent as strings such as `"10.50"` (numbers also work) and come back as 2-decimal strings.
+
+| Method and path | What it does | Success response |
+|-----------------|--------------|------------------|
+| `POST /accounts` | Create a customer account (`owner_name`, `currency` USD or SGD) | `id`, `owner_name`, `currency`, `balance` |
+| `POST /deposit` | Money in from EXTERNAL (`account_id`, `amount`, `idempotency_key`) | `transaction_id`, `new_balance` |
+| `POST /withdraw` | Money out to EXTERNAL, no overdraft | `transaction_id`, `new_balance` |
+| `POST /transactions` | Transfer (`from_account_id`, `to_account_id`, `amount`, `idempotency_key`). `amount` is in the source currency | `transaction_id`, `exchange_rate_used`, both new balances |
+| `POST /transactions/{id}/reverse` | Undo a transaction (`idempotency_key`) | `transaction_id`, `reversal_of`, the offsetting `entries` |
+| `GET /accounts/{id}` | Current balance | account |
+| `GET /accounts/{id}/transactions` | Ledger entries, `page`, `page_size` (1 to 100), `order` (`asc` or `desc`) | `results` list with `transaction_id`, `type`, `entry_type`, `amount`, `description`, `created_at` |
+| `GET /reconciliation/month-end?month=YYYY-MM` | Read-only two-part reconciliation report | per-currency and per-account results, overall `status` |
+
+`POST /transactions` is the transfer asked for in the brief. The brief does not say how money enters the system, so `/deposit` and `/withdraw` were added for that (assumption 11).
+
+**Status codes**
+
+| Code | Meaning |
+|------|---------|
+| 200 | Done |
+| 400 | A business rule refused it: insufficient funds, system account used, same source and destination, below the cross-currency minimum, reversal not allowed |
+| 404 | Account or transaction not found |
+| 409 | Duplicate `idempotency_key`, or transaction already reversed |
+| 422 | Invalid body: amount not above zero, more than 2 decimals, missing field, unsupported currency |
+| 503 | Cross-currency transfer and the exchange rate is unavailable. Nothing is recorded |
+| 500 | A system account is missing (setup problem) |
+
+## Requirements checklist
+
+Where each item of the assignment is covered.
+
+| Requirement | Status | Where |
+|-------------|--------|-------|
+| `POST /transactions` with source, destination, amount, recorded atomically, returns transaction id | Done | API table above, assumption 4 |
+| `GET /accounts/{id}` returns the current balance | Done | API table above |
+| `GET /accounts/{id}/transactions` returns history ordered by timestamp | Done | Newest first by default, `order=asc` for oldest first. Ties broken by entry id so pages never overlap |
+| Transfer is one atomic operation, rejected on insufficient balance | Done | Assumptions 4 and 9 |
+| Transactions can be reversed (posted as a reversal) | Done | Walkthrough, "Reversal rules" |
+| Repeated submission does not cause extra transfers | Done | Assumption 11 |
+| Verify total money in the ledger matches the expected sum, report discrepancies | Done | Month-end reconciliation, check 2 |
+| Transactions between different currencies using exchange rates | Done | Assumptions 7 and 8 |
+| Simultaneous transfers to the same account are safe | Done | Assumption 10, Postgres concurrency tests |
+| Month-end reconciliation of accounts against transaction history | Done, with a limit: it reads live balances | Month-end reconciliation, check 1 |
+| Document assumptions | Done | Assumptions 1 to 14 |
+| Explain anything not implemented | Done | Known limitations, Caching |
+
+## How it works
+
+**Three tables**
+
+```
+accounts 1 ---- * ledger_entries * ---- 1 transactions
+```
+
+- **accounts:** `id`, `owner_name`, `currency`, `balance NUMERIC(18,2)`, `is_system`. Includes 4 system accounts: EXTERNAL and FX_POSITION, one of each per currency.
+- **transactions:** `id`, `idempotency_key` (unique), `type` (DEPOSIT, WITHDRAWAL, TRANSFER, REVERSAL), `reversal_of` (unique), `exchange_rate_used`, `created_at`. One row per business event.
+- **ledger_entries:** `transaction_id`, `account_id`, `entry_type` (DEBIT or CREDIT), `amount` (always positive). The source of truth.
+
+**What one write does, with numbers.** Alice (USD, balance 100.00) transfers 30.00 to Bob (USD, balance 0.00):
+
+1. **Idempotency check.** Has `txn-001` been used? No, so continue.
+2. **Cheap checks.** Source differs from destination, both accounts exist, neither is a system account.
+3. **FX rate (cross-currency only).** Fetched here, before any lock, so a slow rate service never blocks other transfers.
+4. **Lock both accounts**, lower id first (`SELECT ... FOR UPDATE`).
+5. **Check funds.** 100.00 is at least 30.00, so continue.
+6. **Insert** the transaction row and its entries: DEBIT Alice 30.00, CREDIT Bob 30.00.
+7. **Update balances:** Alice 70.00, Bob 30.00.
+8. **Commit.** All of it, or none of it. A duplicate-key clash at the commit becomes a 409.
+
+**Key design decisions**
+
+| Decision | Why | Trade-off |
+|----------|-----|-----------|
+| Double-entry, append-only entries | Every movement balances and is auditable. Fixes are new transactions | More rows per movement |
+| Stored `balance` as a copy of the ledger | Reads are cheap | Two things to keep equal, so reconciliation checks them |
+| Unique `idempotency_key` plus an up-front check | A retry cannot move money twice, even when two copies race | The duplicate gets a 409, not the original result |
+| Row locks, always taken in the same order | No lost updates and no deadlocks | System accounts are hot rows (assumption 10) |
+| EXTERNAL and FX_POSITION system accounts | Each currency nets to zero by itself, so one check covers everything | Four extra rows to lock |
+| Rate fetched at execution and stored on the transaction | History never changes when rates move | No quote step for the customer |
+| `Decimal` and `NUMERIC(18,2)` everywhere on the money path | No floating-point error | Only 2-decimal currencies |
+| Reversal is a new transaction with `reversal_of` unique | The database itself blocks a second reversal, even under a race | Refused when the recipient has already spent the money |
+
 ## Assumptions
 
 Each assumption below is a rule the ledger follows. Examples use made-up numbers.
@@ -189,6 +356,59 @@ This follows one small story through the three tables. Account IDs assume a fres
 - **Recipient already spent the money:** the reversal is refused (400). A real system would use a dispute or compensating process, which this API does not provide.
 - **Locks:** the original transaction's row is locked, then the accounts in the usual order (customers by id, then system accounts by id), so reversals cannot deadlock with other requests.
 
+## Month-end reconciliation (implemented)
+
+Reconciliation is read-only; any discrepancy should be corrected with a new, auditable transaction.
+
+Use `GET /reconciliation/month-end?month=YYYY-MM`. Two checks run, and both use every ledger entry.
+
+**Check 1: each account against its own entries.**
+- Ledger balance = the account's CREDIT entries minus its DEBIT entries. It must equal the stored `accounts.balance`.
+- `difference` is stored minus ledger, so `0.00` means reconciled.
+- Example: Alice has CREDIT 100 and DEBIT 40, so her ledger balance is 60. If her stored balance is 70, the difference is `10.00` and she is a `MISMATCH`.
+- System accounts are included, because their balances move with every entry.
+
+**Check 2: each currency adds up to zero.**
+- Every transaction's entries net to zero within each currency, so the stored balances in one currency (customers, EXTERNAL and FX_POSITION) must sum to `0.00`.
+- Example: Alice deposits 100 USD, withdraws 40, then converts 50 USD to 67.50 SGD for Bob. USD: Alice +10.00, EXTERNAL -60.00, FX_POSITION +50.00, sum 0.00. SGD: Bob +67.50, FX_POSITION -67.50, sum 0.00.
+- This is why a conversion has four entries (assumption 8). Without the FX legs, USD would sum to -50.00 and SGD to +67.50.
+
+**The response** has one row per currency (`customers_total`, `external_total`, `fx_position_total`, `net`, `status`), one row per account (stored, ledger, difference, status, plus the month's opening, credits, debits and closing), a `summary`, `month_has_ended`, and an overall `status` of `RECONCILED` or `OUT_OF_BALANCE`. HTTP 200 either way, so read `status`. An invalid month returns 400.
+
+**Consistent under live traffic.** Every balance and ledger sum is read in one SQL statement, so Postgres gives them the same snapshot. A transfer committing mid-report cannot cause a false result.
+
+**What it cannot do** (see also the limitations table below):
+- The `month` parameter labels and groups activity, but balances are live. There are no saved snapshots, so it cannot reproduce a past month after later transactions.
+- It does not check that each transaction's own entries balance, or that the stored rate matches the amounts.
+- It compares the ledger with itself. It cannot see money that never reached the ledger, or a difference from a real bank statement.
+- Offsetting errors (one account 10 too high, another 10 too low) still sum to zero in check 2, but check 1 flags both accounts.
+
+## Known limitations and how I would solve them
+
+These are deliberate simplifications. Each one is a gap I know about, with the fix I would make.
+
+| Limitation | Fix I would make |
+|------------|------------------|
+| A duplicate request gets a 409, not the original result, and a retry with different details is not detected | Store the response and a hash of the request body with the key. Return the stored response when the hash matches, and a 422 when it does not |
+| Month-end reads live balances, so a past month cannot be reproduced | A write-once `account_snapshots` table (`account_id`, `month`, `closing_balance`, `last_entry_id`), written by a scheduled job right after the check reports `RECONCILED`. Summing one month's snapshots per currency must give 0.00 |
+| Reconciliation does not check each transaction | One query grouping entries by transaction and currency, flagging any group where debits differ from credits |
+| Reconciliation compares the ledger with itself | Import the real bank or custodian statement and compare its totals with EXTERNAL |
+| EXTERNAL and FX_POSITION are hot rows, so deposits, withdrawals and conversions in one currency run one after another | Split each system account into several sub-accounts and sum them |
+| Exchange rate is a daily ECB reference rate from a free service, with no quote step, spread, fallback or age check | A paid quote feed, a short-lived quote the transfer must reference, a second provider, and rejection of rates older than an agreed limit (assumption 7) |
+| A reversal is refused when the recipient already spent the money | A dispute or compensating-transfer process |
+| No authentication or ownership checks | Authenticate callers and check that they own the source account |
+| `created_at` has no timezone and uses the database server clock | `timestamptz`, stored in UTC |
+| Customer balance cannot go below zero, and every transaction's entries balance, but only the application enforces both | A `CHECK (balance >= 0 OR is_system)` constraint, and a deferred constraint trigger that checks debits equal credits per transaction and currency |
+| Tables come from `create_all`, which never alters an existing table | Schema migrations with Alembic |
+| History uses page numbers, so a new entry arriving between page requests shifts the pages | Keyset pagination on (`created_at`, entry id) |
+| Only USD and SGD | Currency metadata (decimal places, rounding) and system accounts per new currency (assumption 2) |
+
+**How I would test the main fixes**
+- **Idempotent replay:** send the same request twice, expect the same body and one transaction. Send it with a different amount, expect a 422.
+- **Snapshots:** post entries across two months, snapshot the first, change balances in the second, and expect the first month to still sum to 0.00. Edit a snapshot row by hand and expect the check to fail.
+- **Per-transaction check:** insert an unbalanced transaction directly in the database and expect it to be flagged.
+- **Sub-accounts:** run 20 parallel deposits in one currency and compare total time and the summed balance before and after.
+
 ## Caching (not implemented)
 
 Balance and history reads are a good fit for caching. This is **not implemented** to keep the ledger simple.
@@ -217,24 +437,28 @@ Balance and history reads are a good fit for caching. This is **not implemented*
 - A displayed balance can be a few seconds out of date.
 - At this scale Postgres handles the read load, so the extra moving part is not worth it yet.
 
-## Month-end reconciliation (implemented)
-
-Reconciliation is read-only; any discrepancy should be corrected with a new, auditable transaction.
-
-For each account, the report compares the stored balance with credits minus debits and reports the difference. It also checks that all accounts, including the system accounts, net to zero in each currency. The report is built from one SQL statement for a consistent snapshot during live traffic.
-
-Use `GET /reconciliation/month-end?month=YYYY-MM`. The response includes monthly activity, per-account and per-currency results, and an overall `RECONCILED` or `OUT_OF_BALANCE` status (HTTP 200 either way; invalid months return 400). The month parameter labels and groups activity, but balances are live: there are no saved historical snapshots, so this cannot reproduce a past month after later transactions. It also does not validate each transaction's entries or rate, nor compare against an external bank statement.
-
 ## Tests and CI
 
-- `tests/test_ledger_endpoints.py` covers the API and business rules using a temporary SQLite database.
-- `tests/test_postgres_concurrency.py` covers locking, concurrent requests, and database rounding on PostgreSQL. SQLite cannot verify these behaviors.
+- `tests/test_ledger_endpoints.py` (77 tests) covers the API and business rules using a temporary SQLite database. It includes reconciliation, reversals, system accounts and a faked FX service (the network is never called in tests).
+- `tests/test_postgres_concurrency.py` (11 tests) covers locking, concurrent requests, and database rounding on PostgreSQL. SQLite cannot verify these behaviors. Examples: 20 parallel deposits into one account lose no update, 20 parallel withdrawals never overdraw, opposite-direction transfers do not deadlock, and 10 identical simultaneous requests move money once.
 - Run the endpoint tests with `pytest tests/test_ledger_endpoints.py`.
 - Run the Postgres tests on their own, against an empty test database (its tables are dropped and recreated):
   `TEST_POSTGRES_URL=postgresql+psycopg://postgres:postgres@localhost:5432/ledger_test pytest tests/test_postgres_concurrency.py`
+- Without `TEST_POSTGRES_URL`, the Postgres file is skipped.
 
 CI (`.github/workflows/ci.yml`) runs both test suites on pushes to `main`, pull requests, or manual dispatch, then builds the Docker Compose stack and performs an API smoke test. The deploy job is simulated and does not deploy anywhere.
 
+## Project layout
+
+```
+app/main.py            API endpoints and business rules
+app/models.py          the three tables (accounts, transactions, ledger_entries)
+app/database.py        database connection and session
+app/create_table.py    creates the tables and the 4 system accounts (run by entrypoint.sh)
+tests/                 endpoint tests (SQLite) and concurrency tests (Postgres)
+Dockerfile, docker-compose.yml, entrypoint.sh   run the API and PostgreSQL
+.github/workflows/ci.yml                        tests and Docker smoke test
+```
 
 ## Local configuration
 
