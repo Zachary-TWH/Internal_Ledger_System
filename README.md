@@ -14,96 +14,18 @@ The core idea: **every movement is a transaction made of balanced DEBIT and CRED
 - **Reconcile:** a month-end report checks every stored balance against the ledger, and checks that each currency adds up to zero.
 - **Stay safe under retries and concurrency:** idempotency keys stop a repeated request from moving money twice, and row locks keep simultaneous requests from losing updates or deadlocking.
 
+To run it: `docker compose up --build`. Details are under [Quick start](#quick-start).
+
 ## Contents
 
-1. [Quick start](#quick-start)
-2. [API at a glance](#api-at-a-glance)
-3. [Requirements checklist](#requirements-checklist)
-4. [How it works](#how-it-works)
+1. [Requirements checklist](#requirements-checklist)
+2. [How it works](#how-it-works)
+3. [Problems this design solves](#problems-this-design-solves)
+4. [API at a glance](#api-at-a-glance)
 5. [Behaviour](#behaviour)
 6. [Walkthrough](#walkthrough-deposit-withdraw-transfer-and-reversal)
-7. [Known limitations and how I would solve them](#known-limitations-and-how-i-would-solve-them)
-8. [Caching (not implemented)](#caching-not-implemented)
-9. [Tests and CI](#tests-and-ci)
-10. [Project layout](#project-layout)
-11. [Local configuration](#local-configuration)
-
-## Quick start
-
-**Needs:** Docker with Compose. Cross-currency transfers also need internet access, because the exchange rate comes from the Frankfurter API (without it they return 503, everything else still works).
-
-**1. Start the stack.** The repository includes a `.env` with a demo database password (see [Local configuration](#local-configuration)), so there is nothing to set up first.
-
-```
-docker compose up --build
-```
-
-This starts PostgreSQL and the API. On start-up the API creates the tables and the 4 system accounts (safe to re-run). The API is at `http://localhost:8000`, and interactive docs are at `http://localhost:8000/docs`.
-
-**2. Try it.** On a fresh database, ids 1 to 4 are the system accounts, so the first customer account is 5.
-
-```
-# Alice (USD, id 5), Bob (USD, id 6), Carol (SGD, id 7)
-curl -s -X POST localhost:8000/accounts -H 'Content-Type: application/json' -d '{"owner_name":"Alice","currency":"USD"}'
-curl -s -X POST localhost:8000/accounts -H 'Content-Type: application/json' -d '{"owner_name":"Bob","currency":"USD"}'
-curl -s -X POST localhost:8000/accounts -H 'Content-Type: application/json' -d '{"owner_name":"Carol","currency":"SGD"}'
-
-# deposit 100.00 USD into Alice
-curl -s -X POST localhost:8000/deposit -H 'Content-Type: application/json' \
-  -d '{"account_id":5,"amount":"100.00","idempotency_key":"dep-001"}'
-
-# transfer 30.00 USD from Alice to Bob
-curl -s -X POST localhost:8000/transactions -H 'Content-Type: application/json' \
-  -d '{"from_account_id":5,"to_account_id":6,"amount":"30.00","idempotency_key":"txn-001"}'
-
-# transfer 40.00 USD from Alice to Carol (USD to SGD, live rate)
-curl -s -X POST localhost:8000/transactions -H 'Content-Type: application/json' \
-  -d '{"from_account_id":5,"to_account_id":7,"amount":"40.00","idempotency_key":"txn-002"}'
-
-# reverse the Bob transfer (transaction 2; the deposit was transaction 1)
-curl -s -X POST localhost:8000/transactions/2/reverse -H 'Content-Type: application/json' \
-  -d '{"idempotency_key":"rev-001"}'
-
-# balance, history, and the month-end report (use the current month)
-curl -s localhost:8000/accounts/5
-curl -s localhost:8000/accounts/5/transactions
-curl -s "localhost:8000/reconciliation/month-end?month=2026-10"
-```
-
-Repeat the first deposit command unchanged. You get a 409 and the balance does not change: that is the idempotency key doing its job.
-
-**Reset to an empty database:** `docker compose down -v`.
-
-**Without Docker:** install `requirements.txt`, set `DATABASE_URL` to a PostgreSQL URL, run `python -m app.create_table` once, then `uvicorn app.main:app`. See [Local configuration](#local-configuration).
-
-## API at a glance
-
-Every write takes a unique `idempotency_key`. Amounts are sent as strings such as `"10.50"` (numbers also work) and come back as 2-decimal strings.
-
-| Method and path | What it does | Success response |
-|-----------------|--------------|------------------|
-| `POST /accounts` | Create a customer account (`owner_name`, `currency` USD or SGD) | `id`, `owner_name`, `currency`, `balance` |
-| `POST /deposit` | Money in from EXTERNAL (`account_id`, `amount`, `idempotency_key`) | `transaction_id`, `new_balance` |
-| `POST /withdraw` | Money out to EXTERNAL, no overdraft | `transaction_id`, `new_balance` |
-| `POST /transactions` | Transfer (`from_account_id`, `to_account_id`, `amount`, `idempotency_key`). `amount` is in the source currency | `transaction_id`, `exchange_rate_used`, both new balances |
-| `POST /transactions/{id}/reverse` | Undo a transaction (`idempotency_key`) | `transaction_id`, `reversal_of`, the offsetting `entries` |
-| `GET /accounts/{id}` | Current balance | account |
-| `GET /accounts/{id}/transactions` | Ledger entries, `page`, `page_size` (1 to 100), `order` (`asc` or `desc`) | `results` list with `transaction_id`, `type`, `entry_type`, `amount`, `description`, `created_at` |
-| `GET /reconciliation/month-end?month=YYYY-MM` | Read-only two-part reconciliation report | per-currency and per-account results, overall `status` |
-
-`POST /transactions` is the transfer asked for in the brief. The brief does not say how money enters the system, so `/deposit` and `/withdraw` were added for that (behaviour 11).
-
-**Status codes**
-
-| Code | Meaning |
-|------|---------|
-| 200 | Done |
-| 400 | A business rule refused it: insufficient funds, system account used, same source and destination, below the cross-currency minimum, reversal not allowed |
-| 404 | Account or transaction not found |
-| 409 | Duplicate `idempotency_key`, or transaction already reversed |
-| 422 | Invalid body: amount not above zero, more than 2 decimals, missing field, unsupported currency |
-| 503 | Cross-currency transfer and the exchange rate is unavailable. Nothing is recorded |
-| 500 | A system account is missing (setup problem) |
+7. [Known limitations and how I would solve them](#known-limitations-and-how-i-would-solve-them) (includes caching)
+8. [Running and testing it](#running-and-testing-it): [Quick start](#quick-start), [Tests and CI](#tests-and-ci), [Project layout](#project-layout), [Local configuration](#local-configuration)
 
 ## Requirements checklist
 
@@ -159,6 +81,63 @@ accounts 1 ---- * ledger_entries * ---- 1 transactions
 | Rate fetched at execution and stored on the transaction | History never changes when rates move | No quote step for the customer |
 | `Decimal` and `NUMERIC(18,2)` everywhere on the money path | No floating-point error | Only 2-decimal currencies |
 | Reversal is a new transaction with `reversal_of` unique | The database itself blocks a second reversal, even under a race | Refused when the recipient has already spent the money |
+
+## Problems this design solves
+
+Each item is a problem that money systems hit, what a simple approach would do, and what this ledger does instead.
+
+**1. Two withdrawals at the same moment.** Account balance 100.00, two withdrawals of 80.00.
+- **Simple approach:** both read 100.00, both pass the check, and the balance ends at -60.00.
+- **This ledger:** the account row is locked (`SELECT ... FOR UPDATE`). The second request waits, reads 20.00 and is rejected with "Insufficient funds" (behaviours 9 and 10).
+
+**2. A client retries after a timeout.** Transfer `txn-001` succeeded, but the response was lost.
+- **Simple approach:** the retry moves the money a second time.
+- **This ledger:** the unique `idempotency_key` rejects the retry with a 409 and the balance does not change. Two identical requests arriving together are stopped by the same constraint, so the loser gets a 409, not a 500 (behaviour 11).
+
+**3. Rounding.** `0.1 + 0.2`.
+- **Simple approach:** floats give `0.30000000000000004`, and errors build up over many transactions.
+- **This ledger:** `Decimal` in Python and `NUMERIC(18,2)` in Postgres give exactly `0.30`. An amount like `10.005` is rejected, not silently rounded (behaviour 1).
+
+**4. A conversion that does not balance.** Alice sends 50 USD and Bob receives 67.50 SGD.
+- **Simple approach:** two entries, -50 USD on Alice and +67.50 SGD on Bob. USD now sums to -50 and SGD to +67.50, so no currency adds up to zero and the totals cannot be checked.
+- **This ledger:** four entries through FX_POSITION, so USD nets to 0 and SGD nets to 0 on their own (behaviour 8).
+
+**5. Fixing a mistake.** A transfer was wrong.
+- **Simple approach:** edit or delete the row. The history is lost and stored balances may stop matching the entries.
+- **This ledger:** post a new REVERSAL transaction with the entries swapped. The original stays untouched, and the unique `reversal_of` stops a second reversal even under a race (walkthrough, "Reversal rules").
+
+**6. Deadlock.** Transfers A to B and B to A at the same time.
+- **Simple approach:** each locks its own source account first. A holds 5 and waits for 6, B holds 6 and waits for 5, and both hang.
+- **This ledger:** every request locks accounts in ascending id order, so both lock 5 first and one waits (behaviour 10).
+
+## API at a glance
+
+Every write takes a unique `idempotency_key`. Amounts are sent as strings such as `"10.50"` (numbers also work) and come back as 2-decimal strings.
+
+| Method and path | What it does | Success response |
+|-----------------|--------------|------------------|
+| `POST /accounts` | Create a customer account (`owner_name`, `currency` USD or SGD) | `id`, `owner_name`, `currency`, `balance` |
+| `POST /deposit` | Money in from EXTERNAL (`account_id`, `amount`, `idempotency_key`) | `transaction_id`, `new_balance` |
+| `POST /withdraw` | Money out to EXTERNAL, no overdraft | `transaction_id`, `new_balance` |
+| `POST /transactions` | Transfer (`from_account_id`, `to_account_id`, `amount`, `idempotency_key`). `amount` is in the source currency | `transaction_id`, `exchange_rate_used`, both new balances |
+| `POST /transactions/{id}/reverse` | Undo a transaction (`idempotency_key`) | `transaction_id`, `reversal_of`, the offsetting `entries` |
+| `GET /accounts/{id}` | Current balance | account |
+| `GET /accounts/{id}/transactions` | Ledger entries, `page`, `page_size` (1 to 100), `order` (`asc` or `desc`) | `results` list with `transaction_id`, `type`, `entry_type`, `amount`, `description`, `created_at` |
+| `GET /reconciliation/month-end?month=YYYY-MM` | Read-only two-part reconciliation report | per-currency and per-account results, overall `status` |
+
+`POST /transactions` is the transfer asked for in the brief. The brief does not say how money enters the system, so `/deposit` and `/withdraw` were added for that (behaviour 11).
+
+**Status codes**
+
+| Code | Meaning |
+|------|---------|
+| 200 | Done |
+| 400 | A business rule refused it: insufficient funds, system account used, same source and destination, below the cross-currency minimum, reversal not allowed |
+| 404 | Account or transaction not found |
+| 409 | Duplicate `idempotency_key`, or transaction already reversed |
+| 422 | Invalid body: amount not above zero, more than 2 decimals, missing field, unsupported currency |
+| 503 | Cross-currency transfer and the exchange rate is unavailable. Nothing is recorded |
+| 500 | A system account is missing (setup problem) |
 
 ## Behaviour
 
@@ -220,6 +199,7 @@ Each item below is a rule the ledger follows. Examples use made-up numbers.
 - **The rate is fetched before any row lock is taken** (after the idempotency check). A slow or hanging FX service therefore never holds up other transfers on those accounts. The only thing read before locking is the account currencies, which never change after creation. Balances are only read after the lock.
 - Only the direct pair is used. No inverse rates, no triangulation.
 
+**FX service assumption.** Frankfurter stands in for the internal rates service a real system would call. The ledger assumes that service is available and returns a sensible rate. Frankfurter publishes European Central Bank reference rates once per working day (about 16:00 CET), so on weekends the last working-day rate is returned. It is free and has no uptime guarantee, which is acceptable here. If the service does fail, the transfer fails closed (503) rather than guessing a rate.
 
 **Not implemented (FX).**
 - No quote-then-confirm step. The customer cannot see the rate before the transfer runs, because the rate is chosen at execution. I would add a short-lived quote (id, rate, expiry) that the transfer must reference, so the customer agrees to a specific rate.
@@ -364,6 +344,8 @@ This walkthrough follows one example through the three tables. Account IDs assum
 
 ## Known limitations and how I would solve them
 
+**Out of scope on purpose.** This is an assignment, not a production system, so these are left out deliberately: authentication and ownership checks, schema migrations, caching, currencies beyond USD and SGD, a paid or redundant FX feed, and scheduled jobs. The table below says how I would handle each gap that matters.
+
 These are deliberate simplifications. Each one is a gap I know about, with the fix I would make.
 
 | Limitation | Fix I would make |
@@ -388,7 +370,7 @@ These are deliberate simplifications. Each one is a gap I know about, with the f
 - **Per-transaction check:** insert an unbalanced transaction directly in the database and expect it to be flagged.
 - **Sub-accounts:** run 20 parallel deposits in one currency and compare total time and the summed balance before and after.
 
-## Caching (not implemented)
+### Caching (not implemented)
 
 Balance and history reads are a good fit for caching. This is **not implemented** to keep the ledger simple.
 
@@ -416,7 +398,57 @@ Balance and history reads are a good fit for caching. This is **not implemented*
 - A displayed balance can be a few seconds out of date.
 - At this scale Postgres handles the read load, so the extra moving part is not worth it yet.
 
-## Tests and CI
+## Running and testing it
+
+### Quick start
+
+**Needs:** Docker with Compose. Cross-currency transfers also need internet access, because the exchange rate comes from the Frankfurter API (without it they return 503, everything else still works).
+
+**1. Start the stack.** The repository includes a `.env` with a demo database password (see [Local configuration](#local-configuration)), so there is nothing to set up first.
+
+```
+docker compose up --build
+```
+
+This starts PostgreSQL and the API. On start-up the API creates the tables and the 4 system accounts (safe to re-run). The API is at `http://localhost:8000`, and interactive docs are at `http://localhost:8000/docs`.
+
+**2. Try it.** On a fresh database, ids 1 to 4 are the system accounts, so the first customer account is 5.
+
+```
+# Alice (USD, id 5), Bob (USD, id 6), Carol (SGD, id 7)
+curl -s -X POST localhost:8000/accounts -H 'Content-Type: application/json' -d '{"owner_name":"Alice","currency":"USD"}'
+curl -s -X POST localhost:8000/accounts -H 'Content-Type: application/json' -d '{"owner_name":"Bob","currency":"USD"}'
+curl -s -X POST localhost:8000/accounts -H 'Content-Type: application/json' -d '{"owner_name":"Carol","currency":"SGD"}'
+
+# deposit 100.00 USD into Alice
+curl -s -X POST localhost:8000/deposit -H 'Content-Type: application/json' \
+  -d '{"account_id":5,"amount":"100.00","idempotency_key":"dep-001"}'
+
+# transfer 30.00 USD from Alice to Bob
+curl -s -X POST localhost:8000/transactions -H 'Content-Type: application/json' \
+  -d '{"from_account_id":5,"to_account_id":6,"amount":"30.00","idempotency_key":"txn-001"}'
+
+# transfer 40.00 USD from Alice to Carol (USD to SGD, live rate)
+curl -s -X POST localhost:8000/transactions -H 'Content-Type: application/json' \
+  -d '{"from_account_id":5,"to_account_id":7,"amount":"40.00","idempotency_key":"txn-002"}'
+
+# reverse the Bob transfer (transaction 2; the deposit was transaction 1)
+curl -s -X POST localhost:8000/transactions/2/reverse -H 'Content-Type: application/json' \
+  -d '{"idempotency_key":"rev-001"}'
+
+# balance, history, and the month-end report (use the current month)
+curl -s localhost:8000/accounts/5
+curl -s localhost:8000/accounts/5/transactions
+curl -s "localhost:8000/reconciliation/month-end?month=2026-10"
+```
+
+Repeat the first deposit command unchanged. You get a 409 and the balance does not change: that is the idempotency key doing its job.
+
+**Reset to an empty database:** `docker compose down -v`.
+
+**Without Docker:** install `requirements.txt`, set `DATABASE_URL` to a PostgreSQL URL, run `python -m app.create_table` once, then `uvicorn app.main:app`. See [Local configuration](#local-configuration).
+
+### Tests and CI
 
 - `tests/test_ledger_endpoints.py` (47 test functions) covers the API and business rules using a temporary SQLite database. It includes reconciliation, reversals, system accounts and a faked FX service (the network is never called in tests).
 - `tests/test_postgres_concurrency.py` (11 test functions) covers locking, concurrent requests, and database rounding on PostgreSQL. SQLite cannot verify these behaviors. Examples: 20 parallel deposits into one account lose no update, 20 parallel withdrawals never overdraw, opposite-direction transfers do not deadlock, and 10 identical simultaneous requests move money once.
@@ -427,7 +459,7 @@ Balance and history reads are a good fit for caching. This is **not implemented*
 
 CI (`.github/workflows/ci.yml`) runs both test suites on pushes to `main`, pull requests, or manual dispatch, then builds the Docker Compose stack and performs an API smoke test. The deploy job is simulated and does not deploy anywhere.
 
-## Project layout
+### Project layout
 
 ```
 app/main.py            API endpoints and business rules
@@ -439,7 +471,7 @@ Dockerfile, docker-compose.yml, entrypoint.sh   run the API and PostgreSQL
 .github/workflows/ci.yml                        tests and Docker smoke test
 ```
 
-## Local configuration
+### Local configuration
 
 The `.env` file is committed on purpose, so the project runs with no setup. It holds a demo credential only:
 
