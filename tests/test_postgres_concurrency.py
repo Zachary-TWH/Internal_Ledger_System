@@ -117,6 +117,8 @@ def statuses(responses):
 # Concurrency
 # ---------------------------------------------------------------------------
 
+# The lost-update problem: each request locks the account row (SELECT ... FOR UPDATE), so
+#   20 concurrent +10 deposits queue up and total exactly 200.
 def test_parallel_deposits_to_one_account_lose_no_updates():
     alice = new_account("alice")
 
@@ -130,6 +132,8 @@ def test_parallel_deposits_to_one_account_lose_no_updates():
     assert entries == 20
 
 
+# Classic check-then-act race: the balance check happens after the row lock, so exactly
+#   10 of the 20 withdrawals succeed and the balance can never go negative.
 def test_parallel_withdrawals_never_overdraw():
     alice = new_account("alice")
     assert deposit(alice, 100, "seed").status_code == 200
@@ -141,6 +145,8 @@ def test_parallel_withdrawals_never_overdraw():
     assert balance_of(alice) == 0
 
 
+# Deadlock avoidance: locks are always taken in ascending account id order, so A->B and
+#   B->A can never end up waiting on each other in a cycle.
 def test_opposite_direction_transfers_do_not_deadlock():
     alice, bob = new_account("alice"), new_account("bob")
     deposit(alice, 100, "seed-a")
@@ -156,6 +162,9 @@ def test_opposite_direction_transfers_do_not_deadlock():
     assert balance_of(alice) == 100 and balance_of(bob) == 100
 
 
+# Idempotency under a race: the fast-path key check cannot see another request's
+#   uncommitted row, so the UNIQUE constraint on idempotency_key is the real guard. Losers get a clean
+#   409.
 def test_identical_simultaneous_requests_move_money_once():
     alice = new_account("alice")
 
@@ -174,6 +183,9 @@ def test_identical_simultaneous_requests_move_money_once():
     assert rows == 1
 
 
+# The hidden hotspot is the shared EXTERNAL row: different customers, same system
+#   account. Its row lock prevents lost updates, at the cost of serialising deposits per currency (a
+#   throughput trade-off).
 def test_parallel_deposits_to_different_accounts_lose_no_update_on_external():
     # every deposit also changes the one shared EXTERNAL_USD row, so this is where a lost update would show
     accounts = [new_account(f"user{i}") for i in range(20)]
@@ -185,6 +197,9 @@ def test_parallel_deposits_to_different_accounts_lose_no_update_on_external():
     assert month_end()["status"] == "RECONCILED"
 
 
+# The strongest locking test: cross-currency transfers both ways plus deposits and
+#   withdrawals at once. Lock order (customers by id, then system accounts) prevents deadlocks, and
+#   each currency still nets to 0.
 def test_parallel_conversions_in_both_directions_do_not_deadlock_and_still_sum_to_zero():
     alice, bob_sgd = new_account("alice"), new_account("bob", "SGD")
     deposit(alice, 1000, "seed-a")
@@ -208,6 +223,9 @@ def test_parallel_conversions_in_both_directions_do_not_deadlock_and_still_sum_t
 # Rounding
 # ---------------------------------------------------------------------------
 
+# Rounding rule: the converted amount is rounded once, half up, to 2 decimals. 13.905
+#   becomes 13.91 (banker's rounding would give 13.90). Needs Postgres because SQLite does not round
+#   NUMERIC.
 @pytest.mark.parametrize("amount, expected_sgd", [
     (10.01, "13.51"),    # 10.01 x 1.35 = 13.5135, rounds down to 13.51
     (10.30, "13.91"),    # 10.30 x 1.35 = 13.905, exactly half, rounds up to 13.91 (half even would give 13.90)
@@ -226,6 +244,8 @@ def test_converted_amount_is_rounded_to_cents(amount, expected_sgd):
     assert credit.amount == Decimal(expected_sgd)
 
 
+# Rounding cannot create or destroy money: both FX legs use the same rounded amount, so
+#   reconciliation still balances to zero.
 def test_month_end_sums_to_zero_after_rounded_conversions():
     alice, bob_sgd = new_account("alice"), new_account("bob", "SGD")
     deposit(alice, 100, "seed")
@@ -246,6 +266,8 @@ def reverse(transaction_id, key):
     return post(f"/transactions/{transaction_id}/reverse", {"idempotency_key": key})
 
 
+# Double-reversal race: the reversal locks the original transaction row, and the UNIQUE
+#   reversal_of is the backstop. Exactly one reversal wins; the rest get 409.
 def test_parallel_reversals_of_the_same_transaction_reverse_it_once():
     alice, bob = new_account("alice"), new_account("bob")
     deposit(alice, 100, "seed")
@@ -263,6 +285,8 @@ def test_parallel_reversals_of_the_same_transaction_reverse_it_once():
     assert month_end()["status"] == "RECONCILED"
 
 
+# Reversals take locks in the same order as transfers (customers then system accounts, by
+#   id), so mixing them with deposits cannot deadlock.
 def test_parallel_reversals_of_conversions_do_not_deadlock_and_still_sum_to_zero():
     alice, bob_sgd = new_account("alice"), new_account("bob", "SGD")
     deposit(alice, 1000, "seed-a")
@@ -286,6 +310,8 @@ def test_parallel_reversals_of_conversions_do_not_deadlock_and_still_sum_to_zero
     assert system_balance("FX_POSITION", "SGD") == Decimal("0.00")
 
 
+# Reversal vs withdrawal racing for the same money: the account row lock serialises them,
+#   so whichever runs second is refused and Bob never goes negative.
 def test_reversal_and_spend_race_never_leaves_the_recipient_negative():
     alice, bob = new_account("alice"), new_account("bob")
     deposit(alice, 100, "seed")
