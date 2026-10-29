@@ -93,19 +93,6 @@ One row per debit or credit posting. The source of truth.
 | `entry_type` | Enum | no | | DEBIT or CREDIT |
 | `amount` | NUMERIC(18,2) | no | check: greater than 0 | Always positive, in the currency of the account. The direction is in `entry_type` |
 
-### What one write does, with numbers
-
-Alice (USD, balance 100.00) transfers 30.00 to Bob (USD, balance 0.00):
-
-1. **Idempotency check.** Has `txn-001` been used? No, so continue.
-2. **Cheap checks.** Source differs from destination, both accounts exist, neither is a system account.
-3. **FX rate (cross-currency only).** Fetched here, before any lock, so a slow rate service never blocks other transfers.
-4. **Lock both accounts**, lower id first (`SELECT ... FOR UPDATE`).
-5. **Check funds.** 100.00 is at least 30.00, so continue.
-6. **Insert** the transaction row and its entries: DEBIT Alice 30.00, CREDIT Bob 30.00.
-7. **Update balances:** Alice 70.00, Bob 30.00.
-8. **Commit.** All of it, or none of it. A duplicate-key clash at the commit becomes a 409 (two identical requests racing).
-
 ### Key design decisions
 
 | Decision | Why | Trade-off |
@@ -151,7 +138,6 @@ Every money-moving write (deposit, withdrawal, transfer or reversal) takes a uni
 Each item below is a rule the ledger follows. Examples use made-up numbers.
 
 **1. Money and decimal precision.**
-- Money uses exact decimal arithmetic, never binary floating-point.
 - Python uses `Decimal` for monetary calculations. PostgreSQL uses `NUMERIC(18,2)` for stored monetary amounts.
 - Example: `Decimal("0.10") + Decimal("0.20")` produces exactly `0.30`.
 - The API accepts monetary amounts as JSON strings (`"10.50"`) or JSON numbers (`10.50`). Both are parsed straight into `Decimal` from the text of the request, never through a float, so `0.1` arrives as exactly `0.1`. Strings are still the safer choice for clients, because their own JSON library may turn a number into a float before sending it.
@@ -171,18 +157,15 @@ Each item below is a rule the ledger follows. Examples use made-up numbers.
 - Set at creation, never changed.
 - `POST /accounts` only accepts a supported currency (USD or SGD, case-insensitive) and rejects anything else with 422, because other currencies have no system accounts and could never be funded.
 - Every amount in an API response is a 2-decimal string such as `"60.00"` (balances, ledger entry amounts, `new_balance`), and `exchange_rate_used` is a 6-decimal string such as `"1.350000"`. FastAPI would otherwise turn a Decimal into a float (`100.1`), so no precision is lost this way.
-- Example: account 3 is SGD, so every entry on it is in SGD.
 
 **4. Every movement is double-entry.**
 - Within each currency, a transaction's debits equal its credits. A DEBIT lowers an account's balance and a CREDIT raises it.
 - Same currency: two entries. Deposit: debit EXTERNAL, credit the user. Withdrawal: debit the user, credit EXTERNAL. Transfer: debit the source, credit the destination.
-- Cross-currency transfer: four entries, through FX_POSITION (see 8).
 - Entries and balance updates commit together, or none of them do (see 16).
 
 **5. Ledger entries are the source of truth. The stored balance is a fast copy.**
 - `accounts.balance` is updated on every posting, for customer accounts and system accounts alike, so reads are cheap.
 - Month-end reconciliation runs two checks: each account's stored balance must equal its own credits minus debits, and the balances in each currency must add up to zero (see 15).
-- Entries are never edited or deleted. A mistake is fixed with a new transaction.
 
 **6. System accounts: EXTERNAL and FX_POSITION.**
 - Two kinds of system account exist, one of each per supported currency, so four in total for USD and SGD. They are created at startup (`is_system = true`).
@@ -192,13 +175,12 @@ Each item below is a rule the ledger follows. Examples use made-up numbers.
 - **FX_POSITION** represents the bank's own currency-exchange counter. It is the account that both sides of a cross-currency conversion go through, so each currency's ledger can net to zero on its own. It is kept separate from EXTERNAL so EXTERNAL keeps one clear meaning: the net money that entered or left the system from outside.
 - Adding system accounts for another currency is currently not supported. They are only created at startup for USD and SGD, so a new currency has no EXTERNAL account and deposits and withdrawals in it fail.
 - Their balance is maintained like any other account's. EXTERNAL goes down on a deposit and up on a withdrawal. A positive FX_POSITION balance is the net amount of that currency the bank took in through conversions, and a negative one is the net amount it paid out.
-- Example: deposit 100 USD, then withdraw 40 USD. EXTERNAL USD balance is -60, the net money that came in from outside.
 
 **7. Transfer amount is in the source account's currency.**
 - Same currency: destination gets the same amount. The FX service is never called.
 - Different currency: the live rate (source to destination) is fetched from the Frankfurter API when the transfer runs, and the destination gets the amount times that rate, rounded to 2 decimals (half up).
 - **Rounding.** The fetched rate is rounded to 6 decimals (half up), the same scale it is stored at. The converted amount is the exact product (amount x rate) rounded once to 2 decimals (half up), with no rounding in between.
-- **Minimum cross-currency transfer: 10 in the source currency for USD/SGD and SGD/USD** (the only supported cross-currency pairs; amounts below 10 are rejected with 400 before the FX call or any lock). A tiny amount at a low rate could otherwise round to 0.00 and break the ledger's `amount > 0` rule. At 10 or more, the converted amount stays positive when the fetched rate is above 0.0005. Same-currency transfers have no minimum beyond 0.01.
+- The cross-currency minimum is 10 in the source currency; see 14 for supported pairs and the rationale.
 - There is **no exchange-rate table**. Only the rate that was actually executed is stored, on the transaction (`exchange_rate_used`, 6 decimals). The rate used is the rate saved, and later rate moves never alter history.
 - **Fail closed.** If the rate cannot be fetched (timeout after 5 seconds, error, malformed or non-positive rate), the cross-currency transfer is rejected with 503 and nothing is recorded. A stale or guessed rate is never used. Same-currency transfers, deposits and withdrawals keep working. Because nothing was recorded, the client can retry with the same idempotency key.
 - **The rate is fetched before any row lock is taken** (after the idempotency check). A slow or hanging FX service therefore never holds up other transfers on those accounts. The only thing read before locking is the account currencies, which never change after creation. Balances are only read after the lock.
@@ -235,7 +217,6 @@ Each item below is a rule the ledger follows. Examples use made-up numbers.
 - The replay does not return the full original response or verify that the new request has the same details. Account creation is not idempotent (see the limitations table).
 
 **12. Timestamps use the database server clock.**
-- `created_at` is stored without a timezone.
 - The month-end report uses it to split each account's entries into before and inside the month (the `opening_balance`, `total_credits`, `total_debits` and `closing_balance` columns) and to set `month_has_ended`. It does not affect the two checks, which always use every entry.
 - Because the clock has no timezone, month boundaries follow the database server's clock. Run the database in UTC.
 
@@ -330,10 +311,6 @@ This walkthrough follows one example through the three tables. Account IDs assum
 | 4 FX transfer | -80 | 40 | -54 | 10 | 30 | 54 |
 | 5 reversal | -80 | 0 | 0 | 50 | 30 | 0 |
 
-**What to notice**
-- **Reversal:** transaction 5 swaps transaction 4's entry directions and reuses its original amounts and rate; nothing in the original transaction is edited.
-- The tables show deposits and withdrawals through EXTERNAL, same-currency transfers with two entries, and FX transfers with four entries through FX_POSITION.
-
 **Reversal rules (`POST /transactions/{id}/reverse`)**
 
 | Request | Result | Why |
@@ -344,9 +321,7 @@ This walkthrough follows one example through the three tables. Account IDs assum
 | Reverse transaction 1 (the 100 USD deposit) | 400 | Alice only has 50.00, so undoing it would take her below zero |
 | Reverse transaction 99 | 404 | no such transaction |
 
-- **Why `type` and `reversal_of`:** code checks the `type` column, not the free-text description. `reversal_of` is unique, so the database itself blocks a second reversal even if two requests race. A check constraint ties the two together: only a REVERSAL has a `reversal_of`, and every REVERSAL has one.
 - **Recipient already spent the money:** the reversal is refused (400). A real system would use a dispute or compensating process, which this API does not provide.
-- **Locks:** the original transaction's row is locked, then the accounts in the usual order (customers by id, then system accounts by id), so reversals cannot deadlock with other requests.
 
 ## Known limitations and how I would solve them
 
@@ -459,6 +434,4 @@ POSTGRES_PASSWORD=mysecret
 
 - `POSTGRES_PASSWORD` is the password of the `postgres` user. Docker Compose uses it for the database and for the API's connection (inside Compose, the API connects to the `db` service, not `localhost`).
 - `DATABASE_URL` is used when running the API outside Docker. It points at a local PostgreSQL database named `ledger`.
-- Run `docker compose up --build` to start the stack.
-
 A real deployment would never commit a password. It would inject secrets through its platform or a secrets manager.
